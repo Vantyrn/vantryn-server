@@ -1,0 +1,23 @@
+# Dependencies
+node_modules/
+
+# Env / secrets — NEVER commit
+.env
+.env.*
+!.env.example
+
+# Firebase service-account keys (private keys!)
+*firebase*adminsdk*.json
+*-adminsdk-*.json
+service-account*.json
+*serviceAccount*.json
+
+# Logs
+*.log
+logs/
+
+# Build / misc
+dist/
+coverage/
+.DS_Store
+*.local

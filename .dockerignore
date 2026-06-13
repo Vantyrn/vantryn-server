@@ -1,0 +1,12 @@
+node_modules
+.git
+.env
+.env.*
+*firebase*adminsdk*.json
+*-adminsdk-*.json
+*.log
+logs
+Dockerfile
+docker-compose.yml
+README.md
+scratch

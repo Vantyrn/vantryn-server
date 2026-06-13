@@ -1,0 +1,35 @@
+{
+  "name": "vantyrn-backend",
+  "version": "1.0.0",
+  "description": "Auth and Order Backend for Vantyrn Vendor/Rider App",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js",
+    "postinstall": "prisma generate --schema=./prisma/schema.prisma"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.1033.0",
+    "@aws-sdk/s3-request-presigner": "^3.1033.0",
+    "@prisma/adapter-pg": "^7.7.0",
+    "@prisma/client": "^7.7.0",
+    "axios": "^1.15.2",
+    "axios-retry": "^4.5.0",
+    "bullmq": "^5.74.1",
+    "cors": "^2.8.5",
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
+    "firebase-admin": "^11.11.0",
+    "helmet": "^8.1.0",
+    "ioredis": "^5.10.1",
+    "pg": "^8.12.0",
+    "socket.io": "^4.8.3",
+    "winston": "^3.19.0",
+    "zod": "^4.4.1"
+  },
+  "devDependencies": {
+    "jest": "^30.3.0",
+    "nodemon": "^3.0.1",
+    "prisma": "^7.7.0"
+  }
+}

@@ -1,0 +1,32 @@
+services:
+  - type: web
+    name: vantryn-server
+    runtime: node
+    # NOTE: the free plan sleeps after inactivity, which drops Socket.io + Shadowfax/Razorpay
+    # webhooks. Use a warm plan (e.g. "starter") for the pilot.
+    plan: starter
+    buildCommand: npm install && npx prisma generate --schema=./prisma/schema.prisma
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      # Set all secrets in the Render dashboard (sync:false = not stored in repo):
+      - key: DATABASE_URL
+        sync: false
+      - key: JWT_SECRET
+        sync: false
+      - key: ADMIN_SECRET
+        sync: false
+      - key: FIREBASE_SERVICE_ACCOUNT
+        sync: false
+      - key: REDIS_URL
+        sync: false
+      - key: SENTRY_DSN
+        sync: false
+      - key: LOKI_URL
+        sync: false
+      - key: LOKI_USER
+        sync: false
+      - key: LOKI_API_KEY
+        sync: false

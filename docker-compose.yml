@@ -1,0 +1,32 @@
+services:
+  # ─── Redis (BullMQ job queues / SLA timers) ─────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: vantryn_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ─── Vantryn Backend ────────────────────────────────────────────────────────────
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: vantryn_backend
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    env_file:
+      - .env
+    environment:
+      - NODE_ENV=production
+      - REDIS_HOST=redis   # point at the compose service, not localhost
+      - REDIS_PORT=6379
+    depends_on:
+      redis:
+        condition: service_healthy
