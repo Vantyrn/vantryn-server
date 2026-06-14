@@ -1,5 +1,20 @@
-require('dotenv').config({ path: require('path').resolve(__dirname, '../.env.server') });
-require('dotenv').config({ path: require('path').resolve(__dirname, '../.env'), override: false });
+// Env precedence: backend-local .env (canonical per SETUP_CREDENTIALS.md) wins,
+// then the legacy monorepo-root files fill any gaps. The backend-local file is
+// loaded first with override so it is authoritative for this service.
+const _path = require('path');
+require('dotenv').config({ path: _path.resolve(__dirname, '.env') });
+require('dotenv').config({ path: _path.resolve(__dirname, '../.env.server'), override: false });
+require('dotenv').config({ path: _path.resolve(__dirname, '../.env'), override: false });
+
+// Central observability (workflow §4.5) — initialize error tracking as early as
+// possible, then bring up the structured logger + request correlation.
+const { initSentry, captureException } = require('./lib/sentry');
+initSentry();
+const logger = require('./lib/logger');
+const requestContext = require('./middleware/requestContext');
+
+// Loud boot-time env assertions — refuse to run insecurely (footgun #7).
+require('./lib/checkEnv')();
 
 const express = require('express'); // Ping for redeploy
 const http = require('http');
@@ -10,11 +25,9 @@ const app = express();
 app.set('etag', false); // Disable ETags to prevent React Native 304 caching bugs
 const server = http.createServer(app);
 
-// GLOBAL TRAFFIC LOGGER (Highest Priority)
-app.use((req, res, next) => {
-  console.log(`🌐 [GLOBAL] ${req.method} ${req.originalUrl}`);
-  next();
-});
+// REQUEST CORRELATION + STRUCTURED LOGGING (highest priority — opens the
+// AsyncLocalStorage scope so every downstream log carries requestId/userId/orderId).
+app.use(requestContext);
 
 const PORT = process.env.PORT || 3000;
 
@@ -31,16 +44,7 @@ server.listen(PORT, '0.0.0.0', () => {
 // ==========================================
 // STAGE 2: MIDDLEWARE & CONFIG
 // ==========================================
-// Structured Request Logging
-app.use((req, res, next) => {
-  const start = Date.now();
-  console.log(`🔍 [DEBUG] Incoming: ${req.method} ${req.originalUrl}`);
-  res.on('finish', () => {
-    const duration = Date.now() - start;
-    console.log(`[API] ${req.method} ${req.originalUrl} ${res.statusCode} - ${duration}ms`);
-  });
-  next();
-});
+// (Request logging + correlation is handled by requestContext, mounted above.)
 
 // URL Rewrite Middleware for push-token compat with older/mismatched frontend versions
 app.use((req, res, next) => {
@@ -98,20 +102,39 @@ app.get('/api/health', healthHandler);
 try {
   const admin = require('firebase-admin');
   if (admin.apps.length === 0) {
+    // Accept EITHER the single-JSON var OR the three split vars (SETUP_CREDENTIALS.md
+    // documents both). Previously only FIREBASE_SERVICE_ACCOUNT was checked, so a
+    // project configured with split vars silently fell back to MOCK auth (footgun #7).
     const serviceAccountVar = process.env.FIREBASE_SERVICE_ACCOUNT;
-    
+    let credentialSource = null;
+
     if (serviceAccountVar) {
       try {
-        const serviceAccount = JSON.parse(serviceAccountVar);
-        admin.initializeApp({
-          credential: admin.credential.cert(serviceAccount)
-        });
-        console.log('✅ [FIREBASE] Admin SDK initialized successfully.');
+        credentialSource = JSON.parse(serviceAccountVar);
       } catch (parseError) {
-        console.error('❌ [FIREBASE] Failed to parse service account JSON:', parseError.message);
+        console.error('❌ [FIREBASE] Failed to parse FIREBASE_SERVICE_ACCOUNT JSON:', parseError.message);
+      }
+    } else if (process.env.FIREBASE_PROJECT_ID && process.env.FIREBASE_CLIENT_EMAIL && process.env.FIREBASE_PRIVATE_KEY) {
+      credentialSource = {
+        projectId: process.env.FIREBASE_PROJECT_ID,
+        clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+        // Env files store the key with literal "\n" — convert back to real newlines.
+        privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n'),
+      };
+    }
+
+    if (credentialSource) {
+      try {
+        admin.initializeApp({ credential: admin.credential.cert(credentialSource) });
+        logger.info('firebase.init.success', { projectId: credentialSource.projectId || credentialSource.project_id });
+        console.log('✅ [FIREBASE] Admin SDK initialized successfully.');
+      } catch (initError) {
+        logger.error('firebase.init.failed', { errMessage: initError.message });
+        console.error('❌ [FIREBASE] initializeApp failed:', initError.message);
       }
     } else {
-      console.warn('⚠️ [FIREBASE] FIREBASE_SERVICE_ACCOUNT missing. Auth will run in mock/fallback mode.');
+      logger.warn('firebase.init.missing_credentials');
+      console.warn('⚠️ [FIREBASE] No service-account credentials (FIREBASE_SERVICE_ACCOUNT or FIREBASE_PROJECT_ID/CLIENT_EMAIL/PRIVATE_KEY). Auth will run in mock/fallback mode.');
     }
   }
 } catch (fbError) {
@@ -163,6 +186,7 @@ try {
     app.use('/api/customer/complaints', complaintRoutes);
     app.use('/api/admin', require('./routes/admin'));
     app.use('/api/sandbox', require('./routes/sandbox'));
+    app.use('/api/telemetry', require('./routes/telemetry'));
 
     // Stage 3 Diagnostic health
     app.get('/api/health/status', (req, res) => {
@@ -175,24 +199,28 @@ try {
 
     // 404 Handler (Phase 1)
     app.use((req, res) => {
-      console.warn(`[404] ${req.method} ${req.originalUrl}`);
-      res.status(404).json({ 
-        error: 'Not Found', 
+      logger.warn('route.not_found', { method: req.method, url: req.originalUrl });
+      res.status(404).json({
+        error: 'Not Found',
         message: `Route ${req.originalUrl} does not exist`,
-        path: req.originalUrl 
+        path: req.originalUrl
       });
     });
 
-    // Global Error Handler (Phase 1)
+    // Global Error Handler (Phase 1) — logs with full correlation + ships to GlitchTip.
     app.use((err, req, res, next) => {
-      console.error('[CRITICAL-ERROR]', {
-        message: err.message,
+      const status = err.status || 500;
+      logger.error('request.error', {
+        errMessage: err.message,
         stack: err.stack,
-        path: req.originalUrl,
-        method: req.method
+        code: err.code,
+        url: req.originalUrl,
+        method: req.method,
+        statusCode: status,
       });
-      
-      res.status(err.status || 500).json({ 
+      if (status >= 500) captureException(err, { url: req.originalUrl, method: req.method });
+
+      res.status(status).json({
         error: 'Internal Server Error',
         message: err.message || 'An unexpected error occurred',
         code: err.code || 'UNKNOWN_ERROR'
@@ -247,10 +275,13 @@ process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
 
 process.on('uncaughtException', (err) => {
-  console.error('❌ [CRITICAL] Uncaught Exception:', err);
+  logger.error('process.uncaughtException', { errMessage: err.message, stack: err.stack });
+  captureException(err, { fatal: true, kind: 'uncaughtException' });
   shutdown('UNCAUGHT_EXCEPTION');
 });
 
-process.on('unhandledRejection', (reason, promise) => {
-  console.error('❌ [CRITICAL] Unhandled Rejection at:', promise, 'reason:', reason);
+process.on('unhandledRejection', (reason) => {
+  const err = reason instanceof Error ? reason : new Error(String(reason));
+  logger.error('process.unhandledRejection', { errMessage: err.message, stack: err.stack });
+  captureException(err, { kind: 'unhandledRejection' });
 });
