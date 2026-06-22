@@ -397,6 +397,24 @@ router.get('/profile', firebaseAuth, async (req, res) => {
       finalProfile.vendor.email = req.user.email;
     }
 
+    // A vendor authenticated via phone OTP has, by definition, a verified phone. Self-heal
+    // the flag (set false on the self-healed vendor record) when the authenticated phone
+    // matches the registered one — otherwise an approved OTP vendor gets bounced to the
+    // redundant one-time re-verification screen instead of landing on the dashboard.
+    if (
+      finalProfile.vendor &&
+      !finalProfile.vendor.phoneVerified &&
+      req.user.phoneNumber &&
+      finalProfile.phoneNumber === req.user.phoneNumber
+    ) {
+      console.log(`[VENDOR] Marking phone verified (OTP-authenticated) for vendor ${finalProfile.vendor.id}`);
+      await prisma.vendor.update({
+        where: { id: finalProfile.vendor.id },
+        data: { phoneVerified: true }
+      });
+      finalProfile.vendor.phoneVerified = true;
+    }
+
     // AUTO-ADOPT PHONE FROM OTHER PROFILES WITH THE SAME EMAIL
     const userEmail = req.user.email;
     if (userEmail && (!finalProfile.phoneNumber || finalProfile.phoneNumber.startsWith('none_'))) {
