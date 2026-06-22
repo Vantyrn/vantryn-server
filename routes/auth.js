@@ -15,6 +15,24 @@ router.post('/sync', firebaseAuth, async (req, res) => {
     // Handle cases where social login has no phone number
     const safePhone = phoneNumber || null;
 
+    // IDENTITY ADOPTION: if a profile already exists for this phone under a DIFFERENT
+    // Firebase UID (admin-created vendor, a prior session, or an app reinstall), relink
+    // it to this UID. Phone-OTP proves ownership, so this is safe — and it prevents the
+    // phone_number unique-constraint crash on create. It also means an already-approved
+    // vendor logging in resumes their existing (ACTIVE) account instead of re-registering.
+    if (safePhone) {
+      const existingByPhone = await withRetry(() => prisma.profile.findFirst({
+        where: { phoneNumber: safePhone, NOT: { firebaseUid: uid } }
+      }));
+      if (existingByPhone) {
+        console.log(`[AUTH-SYNC] Adopting existing profile ${existingByPhone.id} (phone match) to UID ${uid}`);
+        await withRetry(() => prisma.profile.update({
+          where: { id: existingByPhone.id },
+          data: { firebaseUid: uid }
+        }));
+      }
+    }
+
     // Upsert the profile (create if doesn't exist, update if it does)
     const profile = await withRetry(() => prisma.profile.upsert({
       where: { firebaseUid: uid },
