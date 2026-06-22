@@ -12,8 +12,13 @@ router.get('/vendors', guestSession, async (req, res) => {
   try {
     const { category } = req.query;
     
+    // Show every approved/active vendor. We intentionally do NOT filter by
+    // onlineStatus here — the customer app renders an ONLINE/OFFLINE badge per
+    // vendor (VendorCard) and the ordering flow itself blocks offline stores.
+    // Filtering to online-only meant an empty list whenever no vendor happened
+    // to be toggled online. (accountStatus is a Postgres enum — only valid
+    // labels APPROVED/ACTIVE may be used here.)
     const where = {
-      onlineStatus: 'online', 
       accountStatus: { in: ['APPROVED', 'ACTIVE'] }
     };
 

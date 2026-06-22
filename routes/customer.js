@@ -114,17 +114,26 @@ router.get('/profile', firebaseAuth, async (req, res) => {
 
 router.put('/profile', firebaseAuth, requireCustomer, async (req, res) => {
   try {
-    const { fullName, email, profilePicUrl, fcmToken, pushToken } = req.body;
-    
+    const { fullName, email, phone, profilePicUrl, fcmToken, pushToken } = req.body;
+
     // Update Customer record
     const updated = await prisma.customer.update({
       where: { id: req.customer.id },
-      data: { 
-        fullName: fullName || undefined, 
-        email: email || undefined, 
-        profilePicUrl: profilePicUrl || undefined 
+      data: {
+        fullName: fullName || undefined,
+        email: email || undefined,
+        profilePicUrl: profilePicUrl || undefined
       }
     });
+
+    // Phone lives on the Profile (used for identity lookups). Update it when the
+    // client edits it. Empty string clears it; undefined leaves it untouched.
+    if (phone !== undefined && req.customer.profileId) {
+      await prisma.profile.update({
+        where: { id: req.customer.profileId },
+        data: { phoneNumber: phone ? phone.trim() : null }
+      });
+    }
 
     // Sync FCM or Expo Push Token to Profile safely without setting the other to null
     const updateData = {};
@@ -146,17 +155,24 @@ router.put('/profile', firebaseAuth, requireCustomer, async (req, res) => {
       }
     }
 
-    if (Object.keys(updateData).length > 0) {
+    if (Object.keys(updateData).length > 0 && req.customer.profileId) {
       await prisma.profile.update({
         where: { id: req.customer.profileId },
         data: updateData
       });
       console.log(`[CUSTOMER] Notification tokens updated for ${req.customer.id}:`, updateData);
     }
-    res.json({ success: true, customer: updated });
+    // Return both `customer` and `profile` so any client shape works.
+    res.json({ success: true, customer: updated, profile: { ...req.profile, customer: updated } });
   } catch (error) {
     console.error('[CUSTOMER-UPDATE] Failed to update customer profile:', error);
-    res.status(500).json({ error: 'Failed to update profile' });
+    // P2002 = unique constraint — the email or phone already belongs to another account.
+    if (error.code === 'P2002') {
+      const fields = Array.isArray(error.meta?.target) ? error.meta.target.join(',') : (error.meta?.target || '');
+      const what = /phone/i.test(fields) ? 'phone number' : 'email';
+      return res.status(409).json({ error: `That ${what} is already in use by another account.` });
+    }
+    res.status(500).json({ error: 'Failed to update profile', details: error.message });
   }
 });
 

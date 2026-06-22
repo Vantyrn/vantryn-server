@@ -9,6 +9,17 @@ const { v4: uuidv4 } = require('uuid');
 const guestSession = async (req, res, next) => {
   const guestId = req.headers['x-guest-id'];
 
+  // Resilience: the GuestSession model is not part of the active Prisma schema
+  // on this deployment, so prisma.guestSession is undefined. Rather than 500 on
+  // every browsing request, operate in stateless mode — hand out an ephemeral
+  // guest id without DB persistence so browsing (vendors/products) still works.
+  if (!prisma.guestSession) {
+    const id = guestId || `guest_${uuidv4()}`;
+    req.guestId = id;
+    if (!guestId) res.setHeader('x-guest-id', id);
+    return next();
+  }
+
   if (!guestId) {
     // If no guest ID, the frontend should ideally call /api/auth/guest first
     // but we can generate one if it's a browsing request.
