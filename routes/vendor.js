@@ -36,15 +36,21 @@ router.post('/push-token', firebaseAuth, async (req, res) => {
   }
 
   try {
+    // The Profile model/DB only has `fcmToken` (native FCM is the push delivery path).
+    // The Expo `pushToken` has no column, so we don't persist it (writing it caused a
+    // Prisma "Unknown argument pushToken" 500). Fall back to the Expo token only if no
+    // native FCM token was provided, so we still store *something* usable.
+    const tokenToStore = fcmToken || pushToken;
     const updateData = {};
-    if (pushToken) updateData.pushToken = pushToken;
-    if (fcmToken) updateData.fcmToken = fcmToken;
+    if (tokenToStore) updateData.fcmToken = tokenToStore;
 
-    await prisma.profile.update({
-      where: { firebaseUid: uid },
-      data: updateData,
-    });
-    console.log(`[PUSH-TOKEN] Saved tokens for UID ${uid}: pushToken=${!!pushToken}, fcmToken=${!!fcmToken}`);
+    if (Object.keys(updateData).length > 0) {
+      await prisma.profile.update({
+        where: { firebaseUid: uid },
+        data: updateData,
+      });
+    }
+    console.log(`[PUSH-TOKEN] Saved token for UID ${uid}: fcmToken=${!!tokenToStore}`);
     res.json({ success: true });
   } catch (error) {
     console.error('[PUSH-TOKEN] Failed to save tokens:', error);
@@ -201,7 +207,10 @@ function checkVendorOperatingHours(operatingHours) {
 router.post('/kyc', firebaseAuth, async (req, res) => {
   try {
     const { uid } = req.user;
-    const { govIdType, govIdUrl, businessProofType, businessProofUrl, panUrl, addressProofUrl, isfcscUrl } = req.body;
+    // NOTE: the food/FSSAI license (isfcscUrl) is intentionally NOT persisted — the
+    // vendor_kyc table has no column for it yet. The image still lands in R2 at
+    // kyc/<vendorId>/isfcsc.jpg. Add an `isfcsc_url` column (canonical schema) to store it.
+    const { govIdType, govIdUrl, businessProofType, businessProofUrl, panUrl, addressProofUrl } = req.body;
 
     console.log(`[VENDOR] KYC Submission attempt for UID: ${uid}`);
     console.log('[VENDOR] Payload:', JSON.stringify(req.body, null, 2));
@@ -233,7 +242,6 @@ router.post('/kyc', firebaseAuth, async (req, res) => {
           businessProofUrl: businessProofUrl || undefined,
           panUrl: panUrl || undefined,
           addressProofUrl: addressProofUrl || undefined,
-          isfcscUrl: isfcscUrl || undefined,
           status: 'submitted', // Reset status on re-submission
           submittedAt: new Date()
         }
@@ -247,9 +255,8 @@ router.post('/kyc', firebaseAuth, async (req, res) => {
           govIdUrl, 
           businessProofType: businessProofType || 'Business Proof', 
           businessProofUrl, 
-          panUrl, 
+          panUrl,
           addressProofUrl,
-          isfcscUrl,
           status: 'submitted'
         }
       }));
@@ -319,17 +326,36 @@ router.get('/profile', firebaseAuth, async (req, res) => {
     
     if (!profile) {
       console.warn(`[VENDOR] Self-healing: Profile not found for UID ${uid}, creating it now`);
-      await withRetry(() => prisma.profile.create({
-        data: {
-          firebaseUid: uid,
-          phoneNumber: req.user.phoneNumber || `none_${uid.substring(0, 10)}`,
-          role: 'VENDOR',
-          profileStatus: 'PENDING'
+      const phone = req.user.phoneNumber || null;
+      // Adopt an existing profile with the same phone (different UID) instead of
+      // creating a duplicate — phone_number is unique. (Phone-OTP proves ownership.)
+      if (phone) {
+        const existingByPhone = await withRetry(() => prisma.profile.findFirst({
+          where: { phoneNumber: phone, NOT: { firebaseUid: uid } }
+        }));
+        if (existingByPhone) {
+          console.warn(`[VENDOR] Adopting existing profile ${existingByPhone.id} (phone match) to UID ${uid}`);
+          await withRetry(() => prisma.profile.update({
+            where: { id: existingByPhone.id },
+            data: { firebaseUid: uid }
+          }));
         }
-      }));
-      profile = await withRetry(() => prisma.profile.findUnique({ 
-        where: { firebaseUid: uid }, 
-        include: { vendor: { include: { bankDetails: true, complianceFlags: true, operatingHoursList: true, ratingsSummary: true } } } 
+      }
+      // Create only if still missing after adoption.
+      const exists = await withRetry(() => prisma.profile.findUnique({ where: { firebaseUid: uid } }));
+      if (!exists) {
+        await withRetry(() => prisma.profile.create({
+          data: {
+            firebaseUid: uid,
+            phoneNumber: phone || `none_${uid.substring(0, 10)}`,
+            role: 'VENDOR',
+            profileStatus: 'PENDING'
+          }
+        }));
+      }
+      profile = await withRetry(() => prisma.profile.findUnique({
+        where: { firebaseUid: uid },
+        include: { vendor: { include: { bankDetails: true, complianceFlags: true, operatingHoursList: true, ratingsSummary: true } } }
       }));
     }
 
