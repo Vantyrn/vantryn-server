@@ -198,6 +198,21 @@ router.post('/address', firebaseAuth, requireCustomer, async (req, res) => {
       contactName, contactPhone 
     } = req.body;
     
+    const addressType = type || 'Home';
+
+    // Home & Work are unique — at most one of each. Additional addresses must be
+    // saved under a custom label (e.g. "Home 2", "Mom's") via the "Other" option.
+    if (addressType === 'Home' || addressType === 'Work') {
+      const dupe = await prisma.address.findFirst({
+        where: { customerId: req.customer.id, addressType },
+      });
+      if (dupe) {
+        return res.status(409).json({
+          error: `You already have a ${addressType} address. Edit it, or save this one under "Other" with a name.`,
+        });
+      }
+    }
+
     // Core address fields that always exist
     const coreData = {
       addressLine1: addressLine1 || addressLine || 'Default Address',
@@ -208,60 +223,27 @@ router.post('/address', firebaseAuth, requireCustomer, async (req, res) => {
       landmark,
       latitude,
       longitude,
-      addressType: type || 'Home'
+      addressType
     };
 
-    // Find existing address for this customer and this addressType to update, or create new
-    const existingAddress = await prisma.address.findFirst({
-      where: { 
-        customerId: req.customer.id,
-        addressType: type || 'Home'
-      }
-    });
-
+    // Always CREATE a new address so customers can save MULTIPLE addresses.
+    // Edits go through PUT /address/:id; deletes through DELETE /address/:id.
     let address;
     try {
-      if (existingAddress) {
-        address = await prisma.address.update({
-          where: { id: existingAddress.id },
-          data: {
-            ...coreData,
-            contactName,
-            contactPhone
-          }
-        });
-      } else {
-        address = await prisma.address.create({
-          data: {
-            customerId: req.customer.id,
-            ...coreData,
-            contactName,
-            contactPhone
-          }
-        });
-      }
+      address = await prisma.address.create({
+        data: { customerId: req.customer.id, ...coreData, contactName, contactPhone }
+      });
       return res.json({ success: true, address, status: 'fully_synced' });
     } catch (prismaError) {
       console.warn('[PRISMA] Contact columns missing? Falling back to core save.', prismaError.message);
-      
-      if (existingAddress) {
-        address = await prisma.address.update({
-          where: { id: existingAddress.id },
-          data: coreData
-        });
-      } else {
-        address = await prisma.address.create({
-          data: {
-            customerId: req.customer.id,
-            ...coreData
-          }
-        });
-      }
-      return res.json({ 
-        success: true, 
-        address, 
+      address = await prisma.address.create({
+        data: { customerId: req.customer.id, ...coreData }
+      });
+      return res.json({
+        success: true,
+        address,
         status: 'partial_sync',
-        warning: 'Contact details not saved.' 
+        warning: 'Contact details not saved.'
       });
     }
   } catch (error) {
@@ -273,14 +255,55 @@ router.post('/address', firebaseAuth, requireCustomer, async (req, res) => {
 router.put('/address/:id', firebaseAuth, requireCustomer, async (req, res) => {
   try {
     const { id } = req.params;
-    const updateData = req.body;
-    const address = await prisma.address.update({
+    // Whitelist updatable columns (the client may send `type`; map it to addressType).
+    const b = req.body || {};
+    const data = {
+      addressLine1: b.addressLine1 ?? b.addressLine,
+      addressLine2: b.addressLine2,
+      city: b.city, state: b.state, postalCode: b.postalCode,
+      landmark: b.landmark, latitude: b.latitude, longitude: b.longitude,
+      addressType: b.type ?? b.addressType,
+      contactName: b.contactName, contactPhone: b.contactPhone,
+    };
+    // Drop undefined keys so we only update provided fields.
+    Object.keys(data).forEach((k) => data[k] === undefined && delete data[k]);
+
+    // Keep Home/Work unique: block changing this address to a type another already holds.
+    if (data.addressType === 'Home' || data.addressType === 'Work') {
+      const dupe = await prisma.address.findFirst({
+        where: { customerId: req.customer.id, addressType: data.addressType, id: { not: id } },
+      });
+      if (dupe) {
+        return res.status(409).json({
+          error: `You already have a ${data.addressType} address. Use "Other" with a name instead.`,
+        });
+      }
+    }
+
+    // Guard ownership: only update if it belongs to this customer.
+    const result = await prisma.address.updateMany({
       where: { id, customerId: req.customer.id },
-      data: updateData
+      data,
     });
+    if (result.count === 0) return res.status(404).json({ error: 'Address not found' });
+    const address = await prisma.address.findUnique({ where: { id } });
     res.json({ success: true, address });
   } catch (error) {
     res.status(500).json({ error: 'Failed to update address' });
+  }
+});
+
+router.delete('/address/:id', firebaseAuth, requireCustomer, async (req, res) => {
+  try {
+    const { id } = req.params;
+    // deleteMany with the ownership guard so a customer can only delete their own.
+    const result = await prisma.address.deleteMany({
+      where: { id, customerId: req.customer.id },
+    });
+    if (result.count === 0) return res.status(404).json({ error: 'Address not found' });
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to delete address' });
   }
 });
 

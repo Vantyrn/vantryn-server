@@ -7,6 +7,23 @@ const guestSession = require('../middleware/guest');
  * MODULE 2 — VENDOR & PRODUCT BROWSING
  */
 
+// GET /business-categories — the admin-managed list of vendor business categories.
+// Public (guest) so the vendor registration screen and the customer home filter can
+// both source the same single list. Returns only ACTIVE categories, ordered.
+router.get('/business-categories', guestSession, async (req, res) => {
+  try {
+    const categories = await prisma.businessCategory.findMany({
+      where: { isActive: true },
+      orderBy: [{ displayOrder: 'asc' }, { name: 'asc' }],
+      select: { id: true, name: true, isFood: true, displayOrder: true },
+    });
+    res.json({ success: true, categories });
+  } catch (error) {
+    console.error('[BROWSING] Fetch business categories error:', error);
+    res.status(500).json({ error: 'Failed to fetch categories', details: error.message });
+  }
+});
+
 // GET /vendors — list all active (online) vendors
 router.get('/vendors', guestSession, async (req, res) => {
   try {
@@ -56,7 +73,7 @@ router.get('/vendors', guestSession, async (req, res) => {
       ...v,
       name: v.businessName,      // Alias for frontend compatibility 
       description: v.storeDescription, // Alias for frontend compatibility
-      rating: v.ratingsSummary?.avgRating ? Number(v.ratingsSummary.avgRating).toFixed(1) : '4.5',
+      rating: v.ratingsSummary?.avgRating ? Number(v.ratingsSummary.avgRating).toFixed(1) : null,
       logoUrl: v.logoUrl,
       bannerUrl: v.bannerUrl
     }));
@@ -88,7 +105,7 @@ router.get('/vendors/:id', guestSession, async (req, res) => {
     
     const mappedVendor = {
       ...vendor,
-      rating: vendor.ratingsSummary?.avgRating ? Number(vendor.ratingsSummary.avgRating).toFixed(1) : '4.5'
+      rating: vendor.ratingsSummary?.avgRating ? Number(vendor.ratingsSummary.avgRating).toFixed(1) : null
     };
 
     res.json({ success: true, vendor: mappedVendor });
@@ -230,10 +247,12 @@ router.get('/search', guestSession, async (req, res) => {
 
     const queryStr = q.trim();
 
-    // 1. Search Vendors
+    // 1. Search Vendors. We do NOT require online status — offline vendors and
+    // their dishes are still discoverable (the app shows an OPEN/CLOSED badge and
+    // blocks ordering); filtering to online-only made search return nothing
+    // whenever no vendor happened to be toggled online.
     const vendors = await prisma.vendor.findMany({
       where: {
-        onlineStatus: 'online',
         accountStatus: { in: ['APPROVED', 'ACTIVE'] },
         OR: [
           { businessName: { contains: queryStr, mode: 'insensitive' } },
@@ -248,6 +267,9 @@ router.get('/search', guestSession, async (req, res) => {
         logoUrl: true,
         bannerUrl: true,
         businessAddress: true,
+        latitude: true,
+        longitude: true,
+        onlineStatus: true,
         ratingsSummary: true
       }
     });
@@ -255,16 +277,15 @@ router.get('/search', guestSession, async (req, res) => {
     const mappedVendors = vendors.map(v => ({
       ...v,
       name: v.businessName,
-      rating: v.ratingsSummary?.avgRating ? Number(v.ratingsSummary.avgRating).toFixed(1) : '4.5'
+      rating: v.ratingsSummary?.avgRating ? Number(v.ratingsSummary.avgRating).toFixed(1) : null
     }));
 
-    // 2. Search Products
+    // 2. Search Products (across all approved/active vendors).
     const products = await prisma.product.findMany({
       where: {
         isActive: true,
         reviewStatus: { equals: 'APPROVED', mode: 'insensitive' },
         vendor: {
-          onlineStatus: 'online',
           accountStatus: { in: ['APPROVED', 'ACTIVE'] }
         },
         OR: [
@@ -277,7 +298,12 @@ router.get('/search', guestSession, async (req, res) => {
         images: true,
         vendor: {
           select: {
-            businessName: true
+            id: true,
+            businessName: true,
+            onlineStatus: true,
+            latitude: true,
+            longitude: true,
+            ratingsSummary: true
           }
         }
       },
@@ -289,7 +315,12 @@ router.get('/search', guestSession, async (req, res) => {
       image: p.images && p.images.length > 0 ? p.images[0].url : null,
       imageUrl: p.images && p.images.length > 0 ? p.images[0].url : null,
       price: Number(p.basePrice),
-      vendorName: p.vendor?.businessName || 'Partner Restaurant'
+      vendorId: p.vendorId || p.vendor?.id,
+      vendorName: p.vendor?.businessName || 'Partner Restaurant',
+      vendorOnline: p.vendor?.onlineStatus === 'online',
+      vendorLatitude: p.vendor?.latitude,
+      vendorLongitude: p.vendor?.longitude,
+      vendorRating: p.vendor?.ratingsSummary?.avgRating ? Number(p.vendor.ratingsSummary.avgRating).toFixed(1) : null,
     }));
 
     res.json({
