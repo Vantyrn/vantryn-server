@@ -11,28 +11,41 @@ class OrderService {
   /**
    * Create order after payment verification
    */
-  static async createOrderFromCart(cart, customerId, customerName, deliveryPreference, paymentMethod = null, paymentGatewayRef = null, deliveryFee = 0) {
+  static async createOrderFromCart(cart, customerId, customerName, deliveryPreference, paymentMethod = null, paymentGatewayRef = null, deliveryFee = 0, options = {}) {
     if (!cart.vendorId) {
       console.error('[ORDER-SERVICE] CRITICAL: Attempted to create order with NO vendorId');
       throw new Error('CART_INVALID: Missing vendor identification');
     }
 
-    // 1. Check Vendor Availability
-    const vendor = await prisma.vendor.findUnique({ where: { id: cart.vendorId } });
-    if (!vendor || vendor.onlineStatus !== 'online') {
-      throw new Error('VENDOR_OFFLINE: Vendor is currently not accepting orders.');
+    // 1. Check Vendor Availability.
+    // skipVendorAvailabilityCheck is set when the money is ALREADY collected (a
+    // confirmed UPI payment): a paid order must be created even if the vendor just
+    // went offline — the order is honored and the vendor handles it on return.
+    if (!options.skipVendorAvailabilityCheck) {
+      const vendor = await prisma.vendor.findUnique({ where: { id: cart.vendorId } });
+      if (!vendor || vendor.onlineStatus !== 'online') {
+        throw new Error('VENDOR_OFFLINE: Vendor is currently not accepting orders.');
+      }
+
+      const { checkVendorAvailability } = require('../lib/availability');
+      const { isOpen, nextOpen } = checkVendorAvailability(vendor.operatingHours);
+      if (vendor.onlineStatus !== 'online' && !isOpen) {
+        throw new Error(`VENDOR_CLOSED: Vendor is currently closed. Reopening ${nextOpen || 'soon'}.`);
+      }
     }
 
-    const { checkVendorAvailability } = require('../lib/availability');
-    const { isOpen, nextOpen } = checkVendorAvailability(vendor.operatingHours);
-    if (vendor.onlineStatus !== 'online' && !isOpen) {
-      throw new Error(`VENDOR_CLOSED: Vendor is currently closed. Reopening ${nextOpen || 'soon'}.`);
+    // Pin to the address chosen at checkout when provided (options.addressId); otherwise
+    // fall back to the customer's latest address.
+    let activeAddress = null;
+    if (options.addressId) {
+      activeAddress = await prisma.address.findUnique({ where: { id: options.addressId } }).catch(() => null);
     }
-
-    const activeAddress = await prisma.address.findFirst({
-      where: { customerId: customerId },
-      orderBy: { createdAt: 'desc' }
-    });
+    if (!activeAddress) {
+      activeAddress = await prisma.address.findFirst({
+        where: { customerId: customerId },
+        orderBy: { createdAt: 'desc' }
+      });
+    }
 
     const addressSnapshot = activeAddress || { addressLine1: 'Default Address' };
 

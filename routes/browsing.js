@@ -154,6 +154,8 @@ router.get('/vendors/:id/products', guestSession, async (req, res) => {
         image: p.images && p.images.length > 0 ? p.images[0].url : null,
         imageUrl: p.images && p.images.length > 0 ? p.images[0].url : null,
         price: Number(p.basePrice), // Alias for frontend
+        isVeg: (p.productType || '').toLowerCase() === 'veg', // drives the veg/non-veg badge
+        isRestricted: p.isRestricted === true, // explicit 18+ flag for the age gate
         addons: p.addOns?.map(a => ({ ...a, price: Number(a.price || 0) })), // Alias and numeric price
         customizationGroups: (p.customizationGroups || []).map(g => ({
           ...g,

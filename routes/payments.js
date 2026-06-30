@@ -8,18 +8,59 @@ const deliveryService = require('../src/modules/delivery/delivery.service');
 const firebaseAuth = require('../middleware/auth');
 const requireCustomer = require('../middleware/customer');
 const guestSession = require('../middleware/guest');
+const { validateBody, z } = require('../lib/validate');
+
+// Lenient on purpose: only the field the handler genuinely requires is enforced,
+// extra keys (deliveryFee, paymentMethod, customerName, razorpay_*) pass through.
+const verifySchema = z.object({
+  paymentIntentId: z.string().min(1, 'paymentIntentId is required'),
+  status: z.string().optional(),
+  deliveryPreference: z.string().optional(),
+  addressId: z.string().optional(),
+  vendorId: z.string().optional(),
+}).passthrough();
 
 /**
  * MODULE 5 — PAYMENT WEBHOOK
  */
 
 // POST /payments/verify — payment webhook handler (SECURE)
-router.post('/verify', firebaseAuth, requireCustomer, guestSession, async (req, res) => {
+router.post('/verify', firebaseAuth, requireCustomer, guestSession, validateBody(verifySchema), async (req, res) => {
   const { paymentIntentId, status, deliveryPreference, addressId } = req.body;
   const customerId = req.customer.id; // Trusted DB UUID
   const guestId = req.guestId;       // From guestSession middleware
 
   try {
+    // ── Payment authenticity gate ───────────────────────────────────────────
+    // NEVER trust a client-asserted status:'succeeded' on its own. Real payments
+    // must pass Razorpay HMAC verification; sandbox/test payments are accepted
+    // without a real charge ONLY when explicitly enabled (the Razorpay-test pilot)
+    // or in dev — never silently in a live production build.
+    const isSandbox = typeof paymentIntentId === 'string' && paymentIntentId.startsWith('pi_sandbox_');
+    if (isSandbox) {
+      const sandboxAllowed = process.env.SANDBOX_PAYMENTS === 'on' || process.env.NODE_ENV !== 'production';
+      if (!sandboxAllowed) {
+        console.error('[PAYMENT] Sandbox payment rejected: SANDBOX_PAYMENTS off in production.');
+        return res.status(403).json({ error: 'PAYMENT_NOT_VERIFIED', message: 'Test payments are disabled.' });
+      }
+    } else {
+      const { verifyPaymentSignature } = require('../lib/razorpay');
+      let verified = false;
+      try {
+        verified = verifyPaymentSignature({
+          orderId: req.body.razorpay_order_id,
+          paymentId: req.body.razorpay_payment_id || paymentIntentId,
+          signature: req.body.razorpay_signature,
+        });
+      } catch (e) {
+        console.error('[PAYMENT] Signature verification error:', e.message);
+      }
+      if (!verified) {
+        console.error('[PAYMENT] Razorpay signature verification FAILED for intent:', paymentIntentId);
+        return res.status(400).json({ error: 'PAYMENT_NOT_VERIFIED', message: 'Payment could not be verified.' });
+      }
+    }
+
     if (status !== 'succeeded') {
       // Payment failure -> do NOT create order, keep cart intact, return error.
       console.log(`[PAYMENT] Payment failed for intent: ${paymentIntentId}`);
@@ -159,8 +200,87 @@ router.post('/verify', firebaseAuth, requireCustomer, guestSession, async (req, 
         return res.status(400).json({ error: 'CART_ERROR', message: error.message });
     }
 
-    res.status(500).json({ error: 'Failed to process payment verification', details: error.message });
+    res.status(500).json({ error: 'Failed to process payment verification', code: 'PAYMENT_PROCESSING_ERROR' });
   }
+});
+
+// ──────────────────────────────────────────────────────────────────────────
+// UPI deep-link payment confirmation (no PSP webhook).
+// Customer endpoints open a UPI app and report/poll; the order is created ONLY
+// by an authoritative confirm() (Admin reconciliation now, PSP/bank webhook later).
+// ──────────────────────────────────────────────────────────────────────────
+const upiPaymentService = require('../services/upiPaymentService');
+
+// Service-to-service guard for the confirm/reject endpoints: only the Admin server
+// (holding ADMIN_SECRET) or a future PSP webhook proxy may confirm a payment. Reuses
+// the existing admin convention (X-Admin-Key header ↔ ADMIN_SECRET).
+function requireAdminSecret(req, res, next) {
+  const secret = process.env.ADMIN_SECRET;
+  if (!secret) return res.status(503).json({ error: 'CONFIRM_DISABLED', message: 'ADMIN_SECRET not configured.' });
+  const provided = req.headers['x-admin-key'] || req.headers['x-admin-secret'];
+  if (provided !== secret) return res.status(401).json({ error: 'UNAUTHORIZED' });
+  next();
+}
+
+function handleUpiError(res, error, fallback) {
+  const status = error.status || 500;
+  if (status >= 500) console.error('[UPI-ROUTE]', error.message);
+  return res.status(status).json({ success: false, error: error.code || error.message, message: error.message || fallback });
+}
+
+// POST /payments/upi/initiate — create a PENDING request + return the deep-link pieces.
+router.post('/upi/initiate', firebaseAuth, requireCustomer, guestSession, async (req, res) => {
+  try {
+    const { vendorId, addressId, deliveryPreference, deliveryFee, upiApp } = req.body || {};
+    const out = await upiPaymentService.initiate({
+      customerId: req.customer.id, guestId: req.guestId,
+      vendorId, addressId, deliveryPreference, deliveryFee: Number(deliveryFee) || 0, upiApp,
+    });
+    res.json({ success: true, ...out });
+  } catch (e) { handleUpiError(res, e, 'Failed to start UPI payment'); }
+});
+
+// POST /payments/upi/claim — customer reports the outcome after returning (provisional only).
+router.post('/upi/claim', firebaseAuth, requireCustomer, guestSession, async (req, res) => {
+  try {
+    const { tr, clientStatus, utr } = req.body || {};
+    if (!tr) return res.status(400).json({ success: false, message: 'tr is required' });
+    const out = await upiPaymentService.claim({ tr, customerId: req.customer.id, guestId: req.guestId, clientStatus, utr });
+    res.json({ success: true, ...out });
+  } catch (e) { handleUpiError(res, e, 'Failed to record claim'); }
+});
+
+// GET /payments/upi/status?tr= — poll target for the customer screen.
+router.get('/upi/status', firebaseAuth, requireCustomer, guestSession, async (req, res) => {
+  try {
+    const { tr } = req.query;
+    if (!tr) return res.status(400).json({ success: false, message: 'tr is required' });
+    const out = await upiPaymentService.getStatus({ tr, customerId: req.customer.id, guestId: req.guestId });
+    res.json({ success: true, ...out });
+  } catch (e) { handleUpiError(res, e, 'Failed to fetch status'); }
+});
+
+// POST /payments/upi/confirm — AUTHORITATIVE (admin / webhook). Creates the paid order.
+router.post('/upi/confirm', requireAdminSecret, async (req, res) => {
+  try {
+    const { tr, utr, amount, source, actor } = req.body || {};
+    if (!tr) return res.status(400).json({ success: false, message: 'tr is required' });
+    const out = await upiPaymentService.confirm(tr, {
+      utr, amount: amount != null ? Number(amount) : null,
+      source: source || 'ADMIN_MANUAL', actor: actor || 'admin',
+    });
+    res.json({ success: true, ...out });
+  } catch (e) { handleUpiError(res, e, 'Failed to confirm payment'); }
+});
+
+// POST /payments/upi/reject — admin marks a pending payment failed; unlocks the cart.
+router.post('/upi/reject', requireAdminSecret, async (req, res) => {
+  try {
+    const { tr, reason, actor } = req.body || {};
+    if (!tr) return res.status(400).json({ success: false, message: 'tr is required' });
+    const out = await upiPaymentService.reject(tr, { reason, actor: actor || 'admin' });
+    res.json({ success: true, ...out });
+  } catch (e) { handleUpiError(res, e, 'Failed to reject payment'); }
 });
 
 module.exports = router;

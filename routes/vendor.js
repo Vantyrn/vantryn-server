@@ -143,7 +143,12 @@ router.get('/products/byo-assigned', firebaseAuth, async (req, res) => {
       where: { vendor_id: profile.vendor.id },
       include: {
         byo_templates: {
-          include: { byo_template_groups: { orderBy: { display_order: 'asc' } } }
+          include: {
+            byo_template_groups: {
+              orderBy: { display_order: 'asc' },
+              include: { byo_template_options: { orderBy: { display_order: 'asc' } } }
+            }
+          }
         }
       }
     });
@@ -167,6 +172,184 @@ router.get('/products/byo-assigned', firebaseAuth, async (req, res) => {
   } catch (error) {
     console.error('[BYO] Assigned template fetch error:', error);
     res.status(500).json({ error: 'Failed fetching BYO template', details: error.message });
+  }
+});
+
+// ──────────────────────────────────────────────────────────────────────────
+// VENDOR-AUTHORED BYO TEMPLATES — vendors create their own reusable BYO
+// templates. They start 'pending_review' and become usable to build products
+// only once an admin approves them (status 'approved' AND is_active).
+// ──────────────────────────────────────────────────────────────────────────
+
+const BYO_TPL_INCLUDE = {
+  byo_template_groups: {
+    orderBy: { display_order: 'asc' },
+    include: { byo_template_options: { orderBy: { display_order: 'asc' } } }
+  }
+};
+
+// Normalize incoming groups[] (+ options) into a Prisma nested-create payload.
+function buildByoGroupsCreate(groups) {
+  return (Array.isArray(groups) ? groups : [])
+    .filter(g => g && g.name && g.name.trim())
+    .map((g, gi) => ({
+      name: g.name.trim(),
+      selection_type: g.selection_type || 'SINGLE',
+      is_required: g.is_required === true || g.is_required === 'true',
+      max_limit: g.max_limit ? parseInt(g.max_limit) : null,
+      free_threshold: parseInt(g.free_threshold) || 0,
+      extra_price: parseFloat(g.extra_price) || 0,
+      display_order: g.display_order ?? gi,
+      byo_template_options: {
+        create: (Array.isArray(g.options) ? g.options : [])
+          .filter(o => o && o.name && o.name.trim())
+          .map((o, oi) => ({
+            name: o.name.trim(),
+            price_modifier: parseFloat(o.price_modifier) || 0,
+            is_available: o.is_available !== false,
+            display_order: o.display_order ?? oi,
+          }))
+      }
+    }));
+}
+
+async function getVendorOr403(req, res) {
+  const profile = await prisma.profile.findUnique({
+    where: { firebaseUid: req.user.uid },
+    include: { vendor: true }
+  });
+  if (!profile?.vendor) {
+    res.status(403).json({ error: 'Vendor profile not found' });
+    return null;
+  }
+  return profile.vendor;
+}
+
+// GET /api/vendor/byo-templates/usable — templates this vendor may build products
+// from: admin-assigned (approved) + own approved & active. STATIC route → must be
+// declared before the parameterized '/byo-templates/:id' routes.
+router.get('/byo-templates/usable', firebaseAuth, async (req, res) => {
+  try {
+    const vendor = await getVendorOr403(req, res);
+    if (!vendor) return;
+
+    const [assignments, ownApproved] = await Promise.all([
+      prisma.vendor_assigned_templates.findMany({
+        where: { vendor_id: vendor.id },
+        include: { byo_templates: { include: BYO_TPL_INCLUDE } }
+      }),
+      prisma.byo_templates.findMany({
+        where: { vendor_id: vendor.id, status: 'approved', is_active: true },
+        include: BYO_TPL_INCLUDE,
+        orderBy: { created_at: 'desc' }
+      })
+    ]);
+
+    const assigned = assignments
+      .map(a => a.byo_templates)
+      .filter(t => t && t.is_active && t.status === 'approved');
+
+    const byId = new Map();
+    [...assigned, ...ownApproved].forEach(t => { if (t) byId.set(t.id, t); });
+
+    res.json({ success: true, templates: Array.from(byId.values()) });
+  } catch (error) {
+    console.error('[BYO] usable templates error:', error);
+    res.status(500).json({ error: 'Failed fetching usable templates', details: error.message });
+  }
+});
+
+// GET /api/vendor/byo-templates — this vendor's OWN authored templates (all statuses)
+router.get('/byo-templates', firebaseAuth, async (req, res) => {
+  try {
+    const vendor = await getVendorOr403(req, res);
+    if (!vendor) return;
+    const templates = await prisma.byo_templates.findMany({
+      where: { vendor_id: vendor.id },
+      include: BYO_TPL_INCLUDE,
+      orderBy: { created_at: 'desc' }
+    });
+    res.json({ success: true, templates });
+  } catch (error) {
+    console.error('[BYO] list own templates error:', error);
+    res.status(500).json({ error: 'Failed fetching templates', details: error.message });
+  }
+});
+
+// POST /api/vendor/byo-templates — create a vendor-authored template (pending review)
+router.post('/byo-templates', firebaseAuth, async (req, res) => {
+  try {
+    const vendor = await getVendorOr403(req, res);
+    if (!vendor) return;
+    const { name, category, description, groups } = req.body;
+    if (!name || !name.trim()) return res.status(400).json({ error: 'Template name is required' });
+
+    const template = await prisma.byo_templates.create({
+      data: {
+        name: name.trim(),
+        category: category || null,
+        description: description || null,
+        vendor_id: vendor.id,
+        status: 'pending_review',
+        is_active: true,
+        byo_template_groups: { create: buildByoGroupsCreate(groups) }
+      },
+      include: BYO_TPL_INCLUDE
+    });
+    res.json({ success: true, template });
+  } catch (error) {
+    console.error('[BYO] create template error:', error);
+    res.status(500).json({ error: 'Failed creating template', details: error.message });
+  }
+});
+
+// PUT /api/vendor/byo-templates/:id — edit own template; any edit resets it to pending review
+router.put('/byo-templates/:id', firebaseAuth, async (req, res) => {
+  try {
+    const vendor = await getVendorOr403(req, res);
+    if (!vendor) return;
+    const { id } = req.params;
+    const existing = await prisma.byo_templates.findUnique({ where: { id } });
+    if (!existing || existing.vendor_id !== vendor.id) {
+      return res.status(404).json({ error: 'Template not found' });
+    }
+    const { name, category, description, groups } = req.body;
+
+    await prisma.byo_template_groups.deleteMany({ where: { template_id: id } });
+    const template = await prisma.byo_templates.update({
+      where: { id },
+      data: {
+        ...(name && { name: name.trim() }),
+        ...(category !== undefined && { category: category || null }),
+        ...(description !== undefined && { description: description || null }),
+        status: 'pending_review',
+        rejection_reason: null,
+        byo_template_groups: { create: buildByoGroupsCreate(groups) }
+      },
+      include: BYO_TPL_INCLUDE
+    });
+    res.json({ success: true, template });
+  } catch (error) {
+    console.error('[BYO] update template error:', error);
+    res.status(500).json({ error: 'Failed updating template', details: error.message });
+  }
+});
+
+// DELETE /api/vendor/byo-templates/:id — delete own template
+router.delete('/byo-templates/:id', firebaseAuth, async (req, res) => {
+  try {
+    const vendor = await getVendorOr403(req, res);
+    if (!vendor) return;
+    const { id } = req.params;
+    const existing = await prisma.byo_templates.findUnique({ where: { id } });
+    if (!existing || existing.vendor_id !== vendor.id) {
+      return res.status(404).json({ error: 'Template not found' });
+    }
+    await prisma.byo_templates.delete({ where: { id } });
+    res.json({ success: true });
+  } catch (error) {
+    console.error('[BYO] delete template error:', error);
+    res.status(500).json({ error: 'Failed deleting template', details: error.message });
   }
 });
 
@@ -315,10 +498,7 @@ router.get('/profile', firebaseAuth, async (req, res) => {
       include: { 
         vendor: { 
           include: { 
-            bankDetails: true,
-            complianceFlags: true,
-            operatingHoursList: true,
-            ratingsSummary: true
+            bankDetails: true, complianceFlags: true
           } 
         } 
       } 
@@ -355,7 +535,7 @@ router.get('/profile', firebaseAuth, async (req, res) => {
       }
       profile = await withRetry(() => prisma.profile.findUnique({
         where: { firebaseUid: uid },
-        include: { vendor: { include: { bankDetails: true, complianceFlags: true, operatingHoursList: true, ratingsSummary: true } } }
+        include: { vendor: { include: { bankDetails: true, complianceFlags: true } } }
       }));
     }
 
@@ -374,7 +554,7 @@ router.get('/profile', firebaseAuth, async (req, res) => {
       // Re-fetch with the new vendor record
       const updatedProfile = await withRetry(() => prisma.profile.findUnique({ 
         where: { id: profile.id }, 
-        include: { vendor: { include: { bankDetails: true, complianceFlags: true, ratingsSummary: true } } } 
+        include: { vendor: { include: { bankDetails: true, complianceFlags: true } } } 
       }));
       
       if (updatedProfile) {
@@ -454,10 +634,7 @@ router.get('/profile', firebaseAuth, async (req, res) => {
           include: { 
             vendor: { 
               include: { 
-                bankDetails: true,
-                complianceFlags: true,
-                operatingHoursList: true,
-                ratingsSummary: true
+                bankDetails: true, complianceFlags: true
               } 
             } 
           }
@@ -481,7 +658,7 @@ router.get('/profile', firebaseAuth, async (req, res) => {
         const updatedProfile = await prisma.profile.update({
           where: { id: finalProfile.id },
           data: { profileStatus: targetStatus },
-          include: { vendor: { include: { bankDetails: true, complianceFlags: true, operatingHoursList: true, ratingsSummary: true } } }
+          include: { vendor: { include: { bankDetails: true, complianceFlags: true } } }
         });
         finalProfile = updatedProfile;
       }
@@ -520,6 +697,9 @@ router.get('/profile', firebaseAuth, async (req, res) => {
       kycStatus: v.accountStatus,
       profileStatus: finalProfile.profileStatus,
       phoneVerified: v.phoneVerified,
+      // Authoritative online/offline so the app reflects a server-side auto-offline
+      // (e.g. the store was force-closed while online) on the next launch.
+      onlineStatus: v.onlineStatus || 'offline',
       commissionModel: v.commissionModel,
       location: {
         address: v.businessAddress,
@@ -739,7 +919,7 @@ router.put('/status/toggle', firebaseAuth, requireKyc, async (req, res) => {
     const { uid } = req.user;
     const { isOnline, dismissBubble } = req.body;
 
-    const profile = await prisma.profile.findUnique({ where: { firebaseUid: uid }, include: { vendor: true } });
+    const profile = req.profile; // reuse profile+vendor already loaded by requireKyc
     if (!profile?.vendor) {
         console.error(`[VENDOR] Status toggle failed: Vendor not found for UID ${uid}`);
         return res.status(404).json({ error: 'Vendor profile not found' });
@@ -796,7 +976,7 @@ router.put('/status/toggle', firebaseAuth, requireKyc, async (req, res) => {
 router.put('/orders/:id/accept', firebaseAuth, requireKyc, async (req, res) => {
   try {
     const { id } = req.params;
-    const profile = await prisma.profile.findUnique({ where: { firebaseUid: req.user.uid }, include: { vendor: true } });
+    const profile = req.profile; // reuse profile+vendor already loaded by requireKyc
     
     const order = await prisma.order.findUnique({ where: { id } });
     if (!order || order.vendorId !== profile.vendor.id) return res.status(404).json({ error: 'Order not found' });
@@ -829,7 +1009,7 @@ router.put('/orders/:id/reject', firebaseAuth, requireKyc, async (req, res) => {
   try {
     const { id } = req.params;
     const { reason, otherNotes } = req.body;
-    const profile = await prisma.profile.findUnique({ where: { firebaseUid: req.user.uid }, include: { vendor: true } });
+    const profile = req.profile; // reuse profile+vendor already loaded by requireKyc
 
     if (!reason) return res.status(400).json({ error: 'Rejection reason is required' });
     if (reason === 'other' && !otherNotes) return res.status(400).json({ error: 'Notes required when reason is "other"' });
@@ -892,7 +1072,7 @@ router.put('/orders/:id/contact-support', firebaseAuth, requireKyc, async (req, 
   try {
     const { id } = req.params;
     const { reason } = req.body;
-    const profile = await prisma.profile.findUnique({ where: { firebaseUid: req.user.uid }, include: { vendor: true } });
+    const profile = req.profile; // reuse profile+vendor already loaded by requireKyc
     if (!profile?.vendor) return res.status(404).json({ error: 'Vendor not found' });
 
     // 1. Create Support Request Record (User explicitly asked where it was stored)
@@ -1067,7 +1247,7 @@ const formatOrdersForVendorAsync = async (orders) => {
 // Get Vendor Orders (Active & History)
 router.get('/orders', firebaseAuth, requireKyc, async (req, res) => {
   try {
-    const profile = await prisma.profile.findUnique({ where: { firebaseUid: req.user.uid }, include: { vendor: true } });
+    const profile = req.profile; // reuse profile+vendor already loaded by requireKyc
     if (!profile?.vendor) return res.status(404).json({ error: 'Vendor not found' });
 
     const orders = await prisma.order.findMany({
@@ -1300,10 +1480,7 @@ router.get('/products', firebaseAuth, async (req, res) => {
 
 router.post('/products', firebaseAuth, requireKyc, async (req, res) => {
   try {
-    const profile = await prisma.profile.findUnique({ 
-      where: { firebaseUid: req.user.uid }, 
-      include: { vendor: true } 
-    });
+    const profile = req.profile; // reuse profile+vendor already loaded by requireKyc
 
     if (!profile || !profile.vendor) {
       return res.status(403).json({ error: 'Vendor profile not found or initialized' });
@@ -1372,22 +1549,21 @@ router.post('/products', firebaseAuth, requireKyc, async (req, res) => {
       receivedGroups: customizationGroups
     });
 
-    // --- START SMART REVIEW EVALUATION ---
-    let finalStatus = 'APPROVED';
-    let finalReason = null;
+    // --- START REVIEW EVALUATION ---
+    // Pilot policy: EVERY new product requires admin approval before it goes live —
+    // not just structurally-complex ones. It stays pending_review (and inactive) until
+    // an admin approves it. The structural checks below only refine the displayed reason.
+    let finalStatus = 'pending_review';
+    let finalReason = 'New product — awaiting admin approval';
 
-    if (hasAddons) { 
-      finalStatus = 'pending_review'; 
-      finalReason = 'Add-ons detected'; 
-    } else if (hasCustomization) { 
-      finalStatus = 'pending_review'; 
-      finalReason = 'Customization groups/options detected'; 
-    } else if (isRestrictedActive) { 
-      finalStatus = 'pending_review'; 
-      finalReason = 'Age restriction enabled'; 
-    } else if (isNewType) { 
-      finalStatus = 'pending_review'; 
-      finalReason = `Custom product type: ${type}`; 
+    if (hasAddons) {
+      finalReason = 'Add-ons detected';
+    } else if (hasCustomization) {
+      finalReason = 'Customization groups/options detected';
+    } else if (isRestrictedActive) {
+      finalReason = 'Age restriction enabled';
+    } else if (isNewType) {
+      finalReason = `Custom product type: ${type}`;
     }
 
     console.log(`[VENDOR-API] Review Evaluation for "${name}":`, { 
@@ -1505,7 +1681,7 @@ router.put('/products/:id', firebaseAuth, requireKyc, async (req, res) => {
         isCustomizable, customizationType, customizationGroups,
         templateId
       } = req.body;
-      const profile = await withRetry(() => prisma.profile.findUnique({ where: { firebaseUid: req.user.uid }, include: { vendor: true } }));
+      const profile = req.profile; // reuse profile+vendor already loaded by requireKyc
       
       const product = await prisma.product.findFirst({ where: { id, vendorId: profile.vendor.id } });
       if (!product) return res.status(404).json({ error: 'Product not found' });
@@ -1836,7 +2012,7 @@ router.put('/admin-simulate/approve-vendor/:id', firebaseAuth, async (req, res) 
 
 router.delete('/products/:id', firebaseAuth, requireKyc, async (req, res) => {
   try {
-    const profile = await prisma.profile.findUnique({ where: { firebaseUid: req.user.uid }, include: { vendor: true } });
+    const profile = req.profile; // reuse profile+vendor already loaded by requireKyc
     await prisma.product.deleteMany({ where: { id: req.params.id, vendorId: profile.vendor.id } });
     res.json({ success: true });
   } catch (error) {
@@ -1850,7 +2026,7 @@ router.delete('/products/:id', firebaseAuth, requireKyc, async (req, res) => {
 router.get('/earnings', firebaseAuth, requireKyc, async (req, res) => {
   try {
     const { period } = req.query; // daily, weekly, monthly
-    const profile = await prisma.profile.findUnique({ where: { firebaseUid: req.user.uid }, include: { vendor: true } });
+    const profile = req.profile; // reuse profile+vendor already loaded by requireKyc
     
     // 1. Overall Aggregates
     const earnings = await prisma.vendorEarning.aggregate({

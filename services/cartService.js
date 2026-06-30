@@ -13,6 +13,32 @@ class CartService {
   };
 
   /**
+   * Guard for any cart MUTATION while a UPI payment is in flight.
+   * - If the customer has already CLAIMED they paid (payment being confirmed) → block:
+   *   editing now would let the order drift from what they paid for.
+   * - Otherwise any merely-initiated (un-claimed) payment is stale the moment they
+   *   change the cart → void it and unlock, then allow the edit. This is what frees a
+   *   customer who started a payment, went back, and now wants to edit/clear/switch.
+   */
+  static async _assertEditable(identifier) {
+    const { customerId, guestId } = identifier;
+    const who = customerId ? { customerId } : { guestId };
+    const claimed = await prisma.upiPaymentRequest.findFirst({
+      where: { status: { in: ['PENDING', 'CONFIRMING'] }, clientClaim: 'CLAIMED_SUCCESS', ...who },
+      select: { id: true },
+    });
+    if (claimed) {
+      throw { status: 409, code: 'PAYMENT_IN_PROGRESS', message: 'A payment is being confirmed for this cart. Please wait for it to finish before changing items.' };
+    }
+    // Void un-claimed initiated payments and release the cart lock.
+    await prisma.upiPaymentRequest.updateMany({
+      where: { status: 'PENDING', clientClaim: null, ...who },
+      data: { status: 'EXPIRED', failureReason: 'Cart changed before payment' },
+    }).catch(() => {});
+    await prisma.cart.updateMany({ where: who, data: { checkedOutAt: null } }).catch(() => {});
+  }
+
+  /**
    * Add or update an item in the cart
    */
   static async updateCart(identifier, { productId, vendorId, quantity, options, isRestricted }) {
@@ -30,6 +56,10 @@ class CartService {
     }
 
     try {
+        // A merely-initiated payment is voided here so the customer can keep editing;
+        // a CLAIMED ("I've paid") payment blocks edits until it resolves.
+        await CartService._assertEditable({ customerId, guestId });
+
         const expiresAt = new Date(Date.now() + 12 * 60 * 60 * 1000); // 12 hours expiry
 
         // 0. Verify Product belongs to Vendor (SECURITY)
@@ -65,15 +95,15 @@ class CartService {
         const uniqueVendorsInCart = new Set(allProducts.map(p => p.vendorId));
         const alreadyHasThisVendor = uniqueVendorsInCart.has(vendorId);
 
-        if (!alreadyHasThisVendor) {
-          if (!customerId && uniqueVendorsInCart.size >= 1) {
-            // Guest User: 1-vendor limit
-            throw { status: 409, message: 'As a guest, you have 1 free cart per vendor. To shop from multiple restaurants at once, please log in!' };
-          }
-          if (customerId && uniqueVendorsInCart.size >= 3) {
-            // Logged-in User: 3-vendor limit
-            throw { status: 403, message: 'You can only have items from up to 3 different vendors in your cart.' };
-          }
+        // ONE restaurant per order (for everyone). Unlimited items from the SAME
+        // vendor; switching to a different vendor requires clearing the cart first.
+        // 409 → the client prompts "clear cart & add?" and calls overrideCart.
+        if (!alreadyHasThisVendor && uniqueVendorsInCart.size >= 1) {
+          throw {
+            status: 409,
+            code: 'SINGLE_VENDOR_ONLY',
+            message: 'Your cart has items from another restaurant. You can order from only one restaurant at a time — clear the cart to add this item?',
+          };
         }
 
         const start = Date.now();
@@ -287,6 +317,7 @@ class CartService {
 
   static async clearCart(identifier) {
     const { customerId, guestId } = identifier;
+    await CartService._assertEditable(identifier); // voids an un-claimed payment; blocks if claimed
     const cart = await prisma.cart.findFirst({
         where: customerId ? { customerId } : { guestId }
     });
@@ -307,8 +338,12 @@ class CartService {
 
     const cartIds = carts.map(c => c.id);
 
+    // Removing an item voids a merely-initiated payment (the amount would change);
+    // a CLAIMED payment blocks the edit until it resolves.
+    await CartService._assertEditable(identifier);
+
     await prisma.cartItem.deleteMany({
-      where: { 
+      where: {
         id: itemId,
         cartId: { in: cartIds } // Security: Ensure item belongs to one of user's carts
       }
