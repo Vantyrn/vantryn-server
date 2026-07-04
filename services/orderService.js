@@ -1,4 +1,5 @@
 const { prisma } = require('../lib/prisma');
+const logger = require('../lib/logger');
 const { orderSlaQueue } = require('../lib/bullmq');
 const { emitOrderStatusUpdate, emitIncomingOrder } = require('../lib/socket');
 const fcm = require('../lib/fcm');
@@ -133,6 +134,7 @@ class OrderService {
       });
 
       console.log(`[ORDER-SERVICE] Creating breach record for high-value order ${order.id}`);
+      logger.warn('order.sla.breach', { event: 'order.sla.breach', orderId: order.id, vendorId: cart.vendorId, type: 'SUSPICIOUS_ORDER', orderTotal });
       try {
         await prisma.vendorBreach.create({
           data: {
@@ -320,7 +322,18 @@ class OrderService {
     });
 
     emitOrderStatusUpdate(orderId, newStatus, actorRole, order.vendorId);
-    
+
+    // Central journey event for every order status transition (accept, preparing,
+    // ready, dispatched, delivered, cancelled) — queryable in Loki by orderId.
+    logger.info('order.status_changed', {
+      event: 'order.status_changed',
+      orderId,
+      vendorId: order.vendorId,
+      previousStatus: orderToUpdate.status,
+      newStatus,
+      actorRole,
+    });
+
     if (order.customer?.profile?.firebaseUid) {
       let title = `Order Update: ${newStatus}`;
       let body = `Your order status has changed to ${newStatus}.`;
