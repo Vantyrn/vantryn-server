@@ -3,8 +3,10 @@ const axiosRetry = require('axios-retry').default || require('axios-retry');
 const env = require('../../../config/env');
 const logger = require('../../../../lib/logger');
 
-const activeBaseUrl = env.NODE_ENV === 'production' ? 'https://flash-api.shadowfax.in' : 'https://hlbackend.staging.shadowfax.in';
-const activeToken = env.NODE_ENV === 'production' ? env.SFX_PROD_TOKEN : env.SFX_STAGING_TOKEN;
+// Endpoint + token are chosen by SFX_ENV (staging|production), NOT NODE_ENV, so we can point at
+// real staging from any Node env and flip to production by changing a single flag.
+const activeBaseUrl = env.SFX_ACTIVE_BASE_URL;
+const activeToken = env.SFX_ACTIVE_TOKEN;
 
 const shadowfaxClient = axios.create({
   baseURL: activeBaseUrl,
@@ -18,8 +20,10 @@ const shadowfaxClient = axios.create({
 shadowfaxClient.interceptors.request.use(
   (config) => {
     if (activeToken) {
-      // In Shadowfax Flash, the token is passed directly as the Authorization header value without prefixes
-      config.headers['Authorization'] = activeToken;
+      // Shadowfax store-based (HL) API authenticates with a "Token" scheme:
+      //   Authorization: Token <token_id>
+      // Accept a token that already includes the scheme; otherwise prefix it.
+      config.headers['Authorization'] = /^token\s/i.test(activeToken) ? activeToken : `Token ${activeToken}`;
     }
     logger.info(`[Shadowfax API Request] ${config.method.toUpperCase()} ${config.baseURL}${config.url}`);
     return config;

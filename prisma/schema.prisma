@@ -374,11 +374,9 @@ model Vendor {
   accountStatus             AccountStatus               @default(PENDING) @map("account_status")
   commissionModel           CommissionModel?            @map("commission_model")
   commissionRate            Decimal                     @default(5.0) @map("commission_rate") @db.Decimal(5, 2)
-  sfxStoreCode              String?                     @map("sfx_store_code") @db.VarChar(100)
   city                      String?                     @db.VarChar(100)
   pincode                   String?                     @db.VarChar(10)
   delivery_provider         String                      @default("SHADOWFAX") @db.VarChar(50)
-  shadowfax_linked          Boolean                     @default(false)
   phoneVerified             Boolean                     @default(false) @map("phone_verified")
   orders                    Order[]
   byo_templates             byo_templates[]

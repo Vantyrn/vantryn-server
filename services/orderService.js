@@ -4,6 +4,7 @@ const { orderSlaQueue } = require('../lib/bullmq');
 const { emitOrderStatusUpdate, emitIncomingOrder } = require('../lib/socket');
 const fcm = require('../lib/fcm');
 const { checkAndTransitionVendorOffline } = require('../lib/vendorStatusHelper');
+const { ACTIVE_ORDER_STATUSES } = require('../lib/orderStatus');
 
 /**
  * Order Service for managing order lifecycle, status changes, and notifications.
@@ -258,7 +259,7 @@ class OrderService {
     
     // Update Floating Bubble
     const activeOrdersCount = await prisma.order.count({
-      where: { vendorId: cart.vendorId, status: { in: ['preparing', 'ready_for_pickup', 'accepted', 'pending_vendor'] } }
+      where: { vendorId: cart.vendorId, status: { in: ACTIVE_ORDER_STATUSES } }
     });
     fcm.updateFloatingBubble(cart.vendorId, true, activeOrdersCount);
 

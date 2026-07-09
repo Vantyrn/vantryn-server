@@ -9,6 +9,7 @@ router.use((req, res, next) => {
 const firebaseAuth = require('../middleware/auth');
 const requireKyc = require('../middleware/kyc');
 const { prisma, withRetry } = require('../lib/prisma');
+const { ACTIVE_ORDER_STATUSES, isCancellableStatus } = require('../lib/orderStatus');
 
 const fcm = require('../lib/fcm');
 const { orderSlaQueue } = require('../lib/bullmq');
@@ -928,7 +929,7 @@ router.put('/status/toggle', firebaseAuth, requireKyc, async (req, res) => {
     console.log(`[VENDOR] Toggling status for ${profile.vendor.businessName} (${vendorId}) to ${isOnline ? 'ONLINE' : 'OFFLINE'}`);
 
     const activeOrdersCount = await prisma.order.count({
-      where: { vendorId, status: { in: ['preparing', 'ready_for_pickup', 'accepted'] } }
+      where: { vendorId, status: { in: ACTIVE_ORDER_STATUSES } }
     });
 
     if (dismissBubble) {
@@ -1017,18 +1018,9 @@ router.put('/orders/:id/reject', firebaseAuth, requireKyc, async (req, res) => {
     const order = await prisma.order.findUnique({ where: { id } });
     if (!order || order.vendorId !== profile.vendor.id) return res.status(404).json({ error: 'Order not found' });
     
-    // Allow cancellation if not yet picked up or delivered
-    const cancellableStatuses = [
-      'pending_vendor', 
-      'accepted', 
-      'preparing', 
-      'ready_for_pickup', 
-      'Awaiting Vendor Acceptance',
-      'payment_successful'
-    ];
-    
-    if (!cancellableStatuses.includes(order.status)) {
-      return res.status(400).json({ 
+    // Allow cancellation only before the rider takes the parcel (Shadowfax bills 100% after pickup).
+    if (!isCancellableStatus(order.status)) {
+      return res.status(400).json({
         error: `Order cannot be cancelled. Current status: ${order.status}`,
         code: 'ORDER_PROCESSED'
       });
@@ -1325,25 +1317,58 @@ router.get('/orders', firebaseAuth, requireKyc, async (req, res) => {
       
       const formatted = await formatOrdersForVendorAsync(freshOrders);
 
-      const activeStatuses = ['pending_vendor', 'accepted', 'preparing', 'ready_for_pickup', 'pending_vendor_response'];
       return res.json({
-        active: formatted.filter(o => activeStatuses.includes(o.status)),
-        history: formatted.filter(o => !activeStatuses.includes(o.status))
+        active: formatted.filter(o => ACTIVE_ORDER_STATUSES.includes(o.status)),
+        history: formatted.filter(o => !ACTIVE_ORDER_STATUSES.includes(o.status))
       });
     }
 
     // Format for frontend
     const formattedOrders = await formatOrdersForVendorAsync(orders);
 
-    // Split into active (pending, accepted, preparing, ready) and history
-    const activeStatuses = ['pending_vendor', 'accepted', 'preparing', 'ready_for_pickup', 'pending_vendor_response'];
-    const active = formattedOrders.filter(o => activeStatuses.includes(o.status));
-    const history = formattedOrders.filter(o => !activeStatuses.includes(o.status));
+    // Active = awaiting the vendor OR out for delivery. History = terminal.
+    const active = formattedOrders.filter(o => ACTIVE_ORDER_STATUSES.includes(o.status));
+    const history = formattedOrders.filter(o => !ACTIVE_ORDER_STATUSES.includes(o.status));
 
     res.json({ success: true, active, history });
   } catch (error) {
     console.error('[VENDOR] Fetch orders CRITICAL error:', error);
     res.status(500).json({ error: 'Failed to fetch orders', details: error.message });
+  }
+});
+
+// ==========================================
+// Vendor delivery tracking (seed for the order-detail screen)
+// ==========================================
+// Sockets only reach clients already listening; a screen opened after the rider was assigned
+// must seed from here. Rider LOCATION is returned only until pickup — after that the vendor
+// sees status only (same rule the socket layer enforces in lib/socket.js).
+router.get('/orders/:id/tracking', firebaseAuth, requireKyc, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const profile = req.profile; // profile+vendor already loaded by requireKyc
+    if (!profile?.vendor) return res.status(404).json({ error: 'Vendor not found' });
+
+    const order = await prisma.order.findUnique({ where: { id }, select: { vendorId: true, status: true } });
+    if (!order) return res.status(404).json({ error: 'Order not found' });
+    if (order.vendorId !== profile.vendor.id) return res.status(403).json({ error: 'Not your order' });
+
+    const { getSfxTracking } = require('../lib/sfxTracking');
+    const sfxMapper = require('../src/modules/delivery/shadowfax/shadowfax.mapper');
+    const { sfxStatus, rider, riderLocation } = await getSfxTracking(id);
+
+    const prePickup = sfxMapper.isPrePickupOrderStatus(order.status);
+    res.json({
+      success: true,
+      status: order.status,
+      sfxStatus,
+      rider,                                        // identity stays visible after pickup
+      riderLocation: prePickup ? riderLocation : null, // coordinates cut off at pickup
+      prePickup
+    });
+  } catch (error) {
+    console.error('[VENDOR-TRACKING] Failed:', error.message);
+    res.status(500).json({ error: 'Failed to fetch tracking info' });
   }
 });
 
@@ -1937,39 +1962,13 @@ router.put('/admin-simulate/approve-vendor/:id', firebaseAuth, async (req, res) 
     const { status } = req.body; // approved, rejected, suspended, etc.
     const { emitAccountStatusUpdate } = require('../lib/socket');
 
-    // Fetch vendor for SFX automation
-    const vendorData = await prisma.vendor.findUnique({ 
-      where: { id },
-      include: { profile: true }
-    });
+    const vendorData = await prisma.vendor.findUnique({ where: { id } });
     if (!vendorData) return res.status(404).json({ error: 'Vendor not found' });
 
-    let sfxStoreCode = vendorData.sfxStoreCode;
-    if ((status === 'APPROVED' || !status) && !sfxStoreCode && vendorData.latitude && vendorData.longitude) {
-      try {
-        const shadowfaxService = require('../src/modules/delivery/shadowfax/shadowfax.service');
-        const sfxResult = await shadowfaxService.createStore({
-          name: vendorData.businessName,
-          contactName: vendorData.ownerName,
-          contactNumber: vendorData.profile?.phoneNumber || '',
-          address: vendorData.businessAddress,
-          pincode: vendorData.pincode || '110001',
-          city: vendorData.city || 'Default',
-          latitude: Number(vendorData.latitude),
-          longitude: Number(vendorData.longitude)
-        });
-        sfxStoreCode = sfxResult.store_code;
-      } catch (sfxErr) {
-        console.warn('[SIMULATE-APPROVE] SFX store creation failed:', sfxErr.message);
-      }
-    }
-
+    // No Shadowfax store registration — HL Marketplace has no per-vendor store code.
     const vendor = await prisma.vendor.update({
       where: { id },
-      data: { 
-        accountStatus: status || 'APPROVED',
-        sfxStoreCode: sfxStoreCode
-      }
+      data: { accountStatus: status || 'APPROVED' }
     });
 
     // Also update Profile status for consistency

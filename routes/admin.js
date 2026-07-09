@@ -53,42 +53,14 @@ router.put('/vendors/:id/approve', requireAdmin, async (req, res) => {
   try {
     const { id } = req.params;
     
-    // 1. Fetch vendor details for SFX registration
-    const vendorData = await prisma.vendor.findUnique({ 
-      where: { id },
-      include: { profile: true }
-    });
+    const vendorData = await prisma.vendor.findUnique({ where: { id } });
     if (!vendorData) return res.status(404).json({ error: 'Vendor not found' });
 
-    // 2. Automated Shadowfax Store Creation (if not already created)
-    let sfxStoreCode = vendorData.sfxStoreCode;
-    if (!sfxStoreCode && vendorData.latitude && vendorData.longitude) {
-      try {
-        const shadowfaxService = require('../src/modules/delivery/shadowfax/shadowfax.service');
-        const sfxResult = await shadowfaxService.createStore({
-          name: vendorData.businessName,
-          contactName: vendorData.ownerName,
-          contactNumber: vendorData.profile?.phoneNumber || '',
-          address: vendorData.businessAddress,
-          pincode: vendorData.pincode || '110001',
-          city: vendorData.city || 'Default',
-          latitude: Number(vendorData.latitude),
-          longitude: Number(vendorData.longitude)
-        });
-        sfxStoreCode = sfxResult.store_code;
-        console.log(`[ADMIN] Shadowfax store created for vendor ${id}: ${sfxStoreCode}`);
-      } catch (sfxErr) {
-        console.error(`[ADMIN] Shadowfax store creation failed for vendor ${id}:`, sfxErr.message);
-        // We continue with approval but the vendor will need manual store code entry later
-      }
-    }
-
+    // No Shadowfax store registration: the HL Marketplace model has no per-vendor store code.
+    // Outlet onboarding is a one-time account-level activity; pickup coords go per-order.
     const updatedVendor = await prisma.vendor.update({
       where: { id },
-      data: { 
-        accountStatus: 'APPROVED',
-        sfxStoreCode: sfxStoreCode
-      }
+      data: { accountStatus: 'APPROVED' }
     });
 
     // Update VendorKyc record status

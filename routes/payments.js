@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { prisma } = require('../lib/prisma');
+const logger = require('../lib/logger');
 const OrderService = require('../services/orderService');
 const CartService = require('../services/cartService');
 const deliveryService = require('../src/modules/delivery/delivery.service');
@@ -57,6 +58,7 @@ router.post('/verify', firebaseAuth, requireCustomer, guestSession, validateBody
       }
       if (!verified) {
         console.error('[PAYMENT] Razorpay signature verification FAILED for intent:', paymentIntentId);
+        logger.warn('payment.verify.failed', { event: 'payment.verify.failed', reason: 'signature_invalid', paymentIntentId });
         return res.status(400).json({ error: 'PAYMENT_NOT_VERIFIED', message: 'Payment could not be verified.' });
       }
     }
@@ -64,6 +66,7 @@ router.post('/verify', firebaseAuth, requireCustomer, guestSession, validateBody
     if (status !== 'succeeded') {
       // Payment failure -> do NOT create order, keep cart intact, return error.
       console.log(`[PAYMENT] Payment failed for intent: ${paymentIntentId}`);
+      logger.warn('payment.verify.failed', { event: 'payment.verify.failed', reason: 'status_not_succeeded', status, paymentIntentId });
       return res.status(200).json({ success: false, message: 'Payment failed. Cart preserved.' });
     }
 
@@ -105,6 +108,29 @@ router.post('/verify', firebaseAuth, requireCustomer, guestSession, validateBody
     
     cart.deliveryAddress = address ? `${address.addressLine1}, ${address.landmark || ''}` : 'Default Delivery Point';
 
+    // ── Serviceability gate: verify the vendor→customer route is serviceable BEFORE creating
+    //    the order (requirement #1). No-op in SIMULATE mode; a real Shadowfax check in LIVE mode.
+    //    Safe to fail-closed here because the pilot uses placeholder/sandbox payments (no live charge).
+    let serverDeliveryFee = 0;
+    try {
+      const { assertServiceable } = require('../lib/deliveryCost');
+      const vendorForSvc = await prisma.vendor.findUnique({ where: { id: cart.vendorId } });
+      const method = (req.body.paymentMethod || 'Online').toUpperCase();
+      // Server-authoritative fee. NEVER use req.body.deliveryFee — a client can manipulate it.
+      ({ deliveryCost: serverDeliveryFee } = await assertServiceable({
+        vendor: vendorForSvc,
+        address,
+        cartTotal: cart.total,
+        paid: method !== 'CASH' && method !== 'COD'
+      }));
+    } catch (svcErr) {
+      if (svcErr.code === 'DELIVERY_UNAVAILABLE') {
+        return res.status(422).json({ error: 'DELIVERY_UNAVAILABLE', message: svcErr.message });
+      }
+      console.warn('[PAYMENT] Serviceability gate error (blocking order):', svcErr.message);
+      return res.status(422).json({ error: 'DELIVERY_CHECK_FAILED', message: 'Could not verify delivery serviceability.' });
+    }
+
     // 3. Create the order via OrderService
     console.log('[PAYMENT] Creating order from cart:', cart.id);
     const order = await OrderService.createOrderFromCart(
@@ -114,17 +140,19 @@ router.post('/verify', firebaseAuth, requireCustomer, guestSession, validateBody
       deliveryPreference,
       req.body.paymentMethod || 'Online',
       paymentIntentId,
-      req.body.deliveryFee || 0
+      serverDeliveryFee
     ).catch(err => {
         console.error('[PAYMENT] OrderService.createOrderFromCart CRASH:', err.message);
         throw err; // rethrow to hit main catch
     });
 
     console.log('[PAYMENT] Order created successfully:', order.id);
-    
+    logger.info('payment.verify.success', { event: 'payment.verify.success', orderId: order.id, vendorId: cart.vendorId, amount: order.totalAmount, gateway: isSandbox ? 'SANDBOX' : 'RAZORPAY' });
+
     // If order was cancelled by system (e.g. suspicious high-value order), log transaction and return early.
     if (order.status === 'CANCELLED') {
       console.log('[PAYMENT] Order was auto-cancelled by system (suspicious order). Logging transaction and returning early.');
+      logger.warn('order.auto_cancelled', { event: 'order.auto_cancelled', orderId: order.id, reason: 'suspicious_order' });
       await prisma.paymentTransaction.create({
         data: {
           orderId: order.id,
@@ -148,6 +176,8 @@ router.post('/verify', firebaseAuth, requireCustomer, guestSession, validateBody
         webhookPayload: { paymentIntentId, deliveryPreference, addressId, deliveryFee: req.body.deliveryFee }
       }
     }).catch(e => console.warn('[PAYMENT] Failed to log transaction record:', e.message));
+
+    logger.info('order.place', { event: 'order.place', orderId: order.id, vendorId: order.vendorId, amount: order.totalAmount });
 
     // Send Payment Received notification to Vendor via push
     try {
@@ -180,6 +210,7 @@ router.post('/verify', firebaseAuth, requireCustomer, guestSession, validateBody
       await deliveryService.initiateDelivery(order.id);
     } catch (sfxErr) {
       console.error('[PAYMENT] Shadowfax delivery initiation failed:', sfxErr.message);
+      logger.error('delivery.dispatch.failed', { event: 'delivery.dispatch.failed', orderId: order.id, code: sfxErr.code, message: sfxErr.message });
       try {
         const { emitToRoom } = require('../lib/socket');
         emitToRoom('admin:alerts', 'SFX_ORDER_PLACEMENT_FAILED', { orderId: order.id, error: sfxErr.message });
