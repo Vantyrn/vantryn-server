@@ -3,18 +3,24 @@ const router = express.Router();
 const webhookHandler = require('./shadowfax.webhook');
 const env = require('../../../config/env');
 
-// Simple middleware to validate shared secret if provided
+// Validate the secret Shadowfax sends in the Authorization header of its webhook calls.
+// We accept EITHER a dedicated SFX_WEBHOOK_SECRET or the active API token (Shadowfax may reuse
+// the same token value on its callbacks). The header may be raw ("Vantyrn_Secure_2026") or
+// scheme-prefixed ("Bearer …" / "Token …"). If neither is configured we do NOT enforce (dev
+// convenience) but log loudly.
 function validateWebhookSecret(req, res, next) {
-  if (env.SFX_WEBHOOK_SECRET) {
-    const authHeader = req.headers['authorization'];
-    // In a real scenario, this might be an HMAC signature verification
-    // For now, simple token match if specified
-    if (!authHeader || authHeader !== `Bearer ${env.SFX_WEBHOOK_SECRET}`) {
-      console.warn('[Shadowfax Webhook] Unauthorized attempt');
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
+  const accepted = [env.SFX_WEBHOOK_SECRET, env.SFX_ACTIVE_TOKEN].filter(Boolean);
+  if (accepted.length === 0) {
+    console.warn('[Shadowfax Webhook] No SFX_WEBHOOK_SECRET / token set — accepting webhook WITHOUT verification (dev only).');
+    return next();
   }
-  next();
+  const authHeader = (req.headers['authorization'] || '').trim();
+  const bare = authHeader.replace(/^(Bearer|Token)\s+/i, '');
+  if (accepted.includes(authHeader) || accepted.includes(bare)) {
+    return next();
+  }
+  console.warn('[Shadowfax Webhook] Unauthorized attempt (bad/missing Authorization).');
+  return res.status(401).json({ error: 'Unauthorized' });
 }
 
 /**

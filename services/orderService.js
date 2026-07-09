@@ -1,8 +1,10 @@
 const { prisma } = require('../lib/prisma');
+const logger = require('../lib/logger');
 const { orderSlaQueue } = require('../lib/bullmq');
 const { emitOrderStatusUpdate, emitIncomingOrder } = require('../lib/socket');
 const fcm = require('../lib/fcm');
 const { checkAndTransitionVendorOffline } = require('../lib/vendorStatusHelper');
+const { ACTIVE_ORDER_STATUSES } = require('../lib/orderStatus');
 
 /**
  * Order Service for managing order lifecycle, status changes, and notifications.
@@ -11,28 +13,41 @@ class OrderService {
   /**
    * Create order after payment verification
    */
-  static async createOrderFromCart(cart, customerId, customerName, deliveryPreference, paymentMethod = null, paymentGatewayRef = null, deliveryFee = 0) {
+  static async createOrderFromCart(cart, customerId, customerName, deliveryPreference, paymentMethod = null, paymentGatewayRef = null, deliveryFee = 0, options = {}) {
     if (!cart.vendorId) {
       console.error('[ORDER-SERVICE] CRITICAL: Attempted to create order with NO vendorId');
       throw new Error('CART_INVALID: Missing vendor identification');
     }
 
-    // 1. Check Vendor Availability
-    const vendor = await prisma.vendor.findUnique({ where: { id: cart.vendorId } });
-    if (!vendor || vendor.onlineStatus !== 'online') {
-      throw new Error('VENDOR_OFFLINE: Vendor is currently not accepting orders.');
+    // 1. Check Vendor Availability.
+    // skipVendorAvailabilityCheck is set when the money is ALREADY collected (a
+    // confirmed UPI payment): a paid order must be created even if the vendor just
+    // went offline — the order is honored and the vendor handles it on return.
+    if (!options.skipVendorAvailabilityCheck) {
+      const vendor = await prisma.vendor.findUnique({ where: { id: cart.vendorId } });
+      if (!vendor || vendor.onlineStatus !== 'online') {
+        throw new Error('VENDOR_OFFLINE: Vendor is currently not accepting orders.');
+      }
+
+      const { checkVendorAvailability } = require('../lib/availability');
+      const { isOpen, nextOpen } = checkVendorAvailability(vendor.operatingHours);
+      if (vendor.onlineStatus !== 'online' && !isOpen) {
+        throw new Error(`VENDOR_CLOSED: Vendor is currently closed. Reopening ${nextOpen || 'soon'}.`);
+      }
     }
 
-    const { checkVendorAvailability } = require('../lib/availability');
-    const { isOpen, nextOpen } = checkVendorAvailability(vendor.operatingHours);
-    if (vendor.onlineStatus !== 'online' && !isOpen) {
-      throw new Error(`VENDOR_CLOSED: Vendor is currently closed. Reopening ${nextOpen || 'soon'}.`);
+    // Pin to the address chosen at checkout when provided (options.addressId); otherwise
+    // fall back to the customer's latest address.
+    let activeAddress = null;
+    if (options.addressId) {
+      activeAddress = await prisma.address.findUnique({ where: { id: options.addressId } }).catch(() => null);
     }
-
-    const activeAddress = await prisma.address.findFirst({
-      where: { customerId: customerId },
-      orderBy: { createdAt: 'desc' }
-    });
+    if (!activeAddress) {
+      activeAddress = await prisma.address.findFirst({
+        where: { customerId: customerId },
+        orderBy: { createdAt: 'desc' }
+      });
+    }
 
     const addressSnapshot = activeAddress || { addressLine1: 'Default Address' };
 
@@ -120,6 +135,7 @@ class OrderService {
       });
 
       console.log(`[ORDER-SERVICE] Creating breach record for high-value order ${order.id}`);
+      logger.warn('order.sla.breach', { event: 'order.sla.breach', orderId: order.id, vendorId: cart.vendorId, type: 'SUSPICIOUS_ORDER', orderTotal });
       try {
         await prisma.vendorBreach.create({
           data: {
@@ -243,7 +259,7 @@ class OrderService {
     
     // Update Floating Bubble
     const activeOrdersCount = await prisma.order.count({
-      where: { vendorId: cart.vendorId, status: { in: ['preparing', 'ready_for_pickup', 'accepted', 'pending_vendor'] } }
+      where: { vendorId: cart.vendorId, status: { in: ACTIVE_ORDER_STATUSES } }
     });
     fcm.updateFloatingBubble(cart.vendorId, true, activeOrdersCount);
 
@@ -307,7 +323,18 @@ class OrderService {
     });
 
     emitOrderStatusUpdate(orderId, newStatus, actorRole, order.vendorId);
-    
+
+    // Central journey event for every order status transition (accept, preparing,
+    // ready, dispatched, delivered, cancelled) — queryable in Loki by orderId.
+    logger.info('order.status_changed', {
+      event: 'order.status_changed',
+      orderId,
+      vendorId: order.vendorId,
+      previousStatus: orderToUpdate.status,
+      newStatus,
+      actorRole,
+    });
+
     if (order.customer?.profile?.firebaseUid) {
       let title = `Order Update: ${newStatus}`;
       let body = `Your order status has changed to ${newStatus}.`;

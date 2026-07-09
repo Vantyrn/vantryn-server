@@ -72,7 +72,11 @@ const requireKyc = async (req, res, next) => {
       '+910000000000',
       '+919063851105'
     ];
-    if (process.env.NODE_ENV !== 'production') {
+    // Demo footgun: auto-approving KYC for test numbers is gated on the single
+    // DEV_BYPASS flag (off in the pilot) rather than NODE_ENV — so a deploy that
+    // forgets NODE_ENV=production can't silently waive KYC. checkEnv refuses to
+    // boot in production when DEV_BYPASS=on.
+    if (process.env.DEV_BYPASS === 'on') {
       if (mockNumbers.includes(profile.phoneNumber)) {
         isApproved = true;
       }

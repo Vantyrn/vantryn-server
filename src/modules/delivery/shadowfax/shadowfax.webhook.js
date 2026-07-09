@@ -5,7 +5,7 @@ const logger = require('../../../../lib/logger');
 
 class ShadowfaxWebhookHandler {
   /**
-   * Handle incoming status callbacks.
+   * Handle incoming status callbacks (order lifecycle: ALLOTTED → ARRIVED → DISPATCHED → DELIVERED …).
    */
   async handleStatusCallback(rawPayload) {
     let validatedData;
@@ -22,11 +22,11 @@ class ShadowfaxWebhookHandler {
       throw new Error('Missing client order identifier');
     }
 
-    // Find the corresponding local SFX order
     let sfxOrder;
     try {
       sfxOrder = await prisma.sfxOrder.findFirst({
-        where: { clientOrderId: coid }
+        where: { clientOrderId: coid },
+        include: { order: true }
       });
     } catch (err) {
       logger.error(`[Shadowfax Webhook] Failed DB query for clientOrderId ${coid}: ${err.message}`);
@@ -39,32 +39,28 @@ class ShadowfaxWebhookHandler {
 
     const resolvedSfxOrderId = validatedData.sfx_order_id || sfxOrder.sfxOrderId;
 
-    // Idempotency Check
+    // Idempotency Check — skip a repeat of the same status.
     try {
       const existingCallbacks = await prisma.sfxCallback.findMany({
-        where: {
-          sfxOrderId: resolvedSfxOrderId,
-          processed: true
-        }
+        where: { sfxOrderId: resolvedSfxOrderId, processed: true }
       });
-      const isDuplicate = existingCallbacks.some(cb => cb.payload && cb.payload.status === validatedData.status);
+      // Marketplace sends `order_status`; older payloads sent `status`. Compare against both.
+      const isDuplicate = existingCallbacks.some(
+        cb => cb.payload && (cb.payload.status || cb.payload.order_status) === validatedData.status
+      );
       if (isDuplicate) {
-        logger.info(`[Shadowfax Webhook] Duplicate status callback received for SFX Order ${resolvedSfxOrderId}: ${validatedData.status}. Skipping.`);
+        logger.info(`[Shadowfax Webhook] Duplicate status callback for SFX Order ${resolvedSfxOrderId}: ${validatedData.status}. Skipping.`);
         return { duplicate: true };
       }
     } catch (err) {
-      logger.error(`[Shadowfax Webhook] Failed to perform idempotency check: ${err.message}`);
+      logger.error(`[Shadowfax Webhook] Failed idempotency check: ${err.message}`);
     }
 
-    // Save callback record
+    // Persist the raw payload (also our source of rider identity for the tracking endpoint).
     let dbRecordId;
     try {
       const dbRecord = await prisma.sfxCallback.create({
-        data: {
-          sfxOrderId: resolvedSfxOrderId,
-          payload: rawPayload,
-          processed: false
-        }
+        data: { sfxOrderId: resolvedSfxOrderId, payload: rawPayload, processed: false }
       });
       dbRecordId = dbRecord.id;
     } catch (error) {
@@ -72,20 +68,23 @@ class ShadowfaxWebhookHandler {
     }
 
     const internalStatus = mapper.mapSfxStatusToInternal(validatedData.status);
-    
-    // Call DeliveryService to update internal order state
+    const rider = mapper.extractRider(validatedData);
+
+    // Update internal order state + notify all parties (customer/vendor/admin sockets).
     try {
       const deliveryService = require('../delivery.service');
       await deliveryService.processSfxStatusUpdate({
         sfxOrderId: resolvedSfxOrderId.toString(),
-        internalStatus,
+        internalStatus,                       // null for ACCEPTED / unknown → Order.status untouched
+        sfxStatusRaw: validatedData.status,
+        rider,
         dbCallbackId: dbRecordId
       });
     } catch (e) {
       logger.error(`[Shadowfax Webhook] Failed to process status via DeliveryService: ${e.message}`);
     }
 
-    // Flash status callbacks often contain live coordinates. If present, save and broadcast them!
+    // Flash/store status callbacks often include live coordinates — save + broadcast them.
     if (typeof validatedData.rider_latitude === 'number' && typeof validatedData.rider_longitude === 'number') {
       try {
         await prisma.sfxRiderLocationLog.create({
@@ -98,6 +97,13 @@ class ShadowfaxWebhookHandler {
           }
         });
 
+        // Vendor gets live location ONLY until pickup. `internalStatus` is null for events that
+        // carry no state change (e.g. ACCEPTED), so fall back to the order's current status.
+        const effectiveStatus = internalStatus || sfxOrder.order?.status;
+        const vendorIdForEmit = mapper.isPrePickupOrderStatus(effectiveStatus)
+          ? (sfxOrder.order?.vendorId ?? null)
+          : null;
+
         const { emitLocationUpdate } = require('../../../../lib/socket');
         emitLocationUpdate(
           sfxOrder.internalOrderId,
@@ -105,7 +111,8 @@ class ShadowfaxWebhookHandler {
           validatedData.rider_longitude,
           validatedData.pickup_eta,
           validatedData.drop_eta,
-          sfxOrder.order ? sfxOrder.order.vendorId : null
+          vendorIdForEmit,
+          rider
         );
       } catch (locErr) {
         logger.error(`[Shadowfax Webhook] Failed to save/emit status-bound rider location: ${locErr.message}`);
@@ -121,7 +128,7 @@ class ShadowfaxWebhookHandler {
   }
 
   /**
-   * Handle incoming location callbacks.
+   * Handle incoming rider-location callbacks (periodic during the delivery run).
    */
   async handleLocationCallback(rawPayload) {
     let validatedData;
@@ -132,9 +139,9 @@ class ShadowfaxWebhookHandler {
       throw new Error('Invalid payload');
     }
 
-    const coid = validatedData.coid || validatedData.client_order_id;
+    const coid = validatedData.coid || validatedData.client_order_id || validatedData.order_id;
     if (!coid) {
-      logger.error('[Shadowfax Webhook] Missing coid/client_order_id in location callback');
+      logger.error('[Shadowfax Webhook] Missing coid/order_id in location callback');
       throw new Error('Missing client order identifier');
     }
 
@@ -150,6 +157,7 @@ class ShadowfaxWebhookHandler {
       }
 
       const resolvedSfxOrderId = validatedData.sfx_order_id || sfxOrder.sfxOrderId;
+      const rider = mapper.extractRider(validatedData);
 
       await prisma.sfxRiderLocationLog.create({
         data: {
@@ -161,31 +169,34 @@ class ShadowfaxWebhookHandler {
         }
       });
 
-      if (sfxOrder.order) {
-        const { emitLocationUpdate } = require('../../../../lib/socket');
-        emitLocationUpdate(
-          sfxOrder.internalOrderId,
-          validatedData.rider_latitude,
-          validatedData.rider_longitude,
-          validatedData.pickup_eta,
-          validatedData.drop_eta,
-          sfxOrder.order.vendorId
-        );
-      }
+      // Vendor receives coordinates only pre-pickup (decided by the order's current status).
+      const vendorIdForEmit = (sfxOrder.order && mapper.isPrePickupOrderStatus(sfxOrder.order.status))
+        ? sfxOrder.order.vendorId
+        : null;
+
+      const { emitLocationUpdate } = require('../../../../lib/socket');
+      emitLocationUpdate(
+        sfxOrder.internalOrderId,
+        validatedData.rider_latitude,
+        validatedData.rider_longitude,
+        validatedData.pickup_eta,
+        validatedData.drop_eta,
+        vendorIdForEmit,
+        rider
+      );
+
+      return {
+        lat: validatedData.rider_latitude,
+        lng: validatedData.rider_longitude,
+        orderId: coid,
+        pickupEta: validatedData.pickup_eta,
+        dropEta: validatedData.drop_eta
+      };
     } catch (error) {
       logger.error(`[Shadowfax Webhook] Failed to save location log or emit: ${error.message}`);
+      return { skipped: true, reason: error.message };
     }
-
-    return {
-      lat: validatedData.rider_latitude,
-      lng: validatedData.rider_longitude,
-      orderId: coid,
-      pickupEta: validatedData.pickup_eta,
-      dropEta: validatedData.drop_eta
-    };
   }
 }
 
 module.exports = new ShadowfaxWebhookHandler();
-
-

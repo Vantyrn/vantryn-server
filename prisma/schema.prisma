@@ -206,6 +206,22 @@ model Category {
   @@schema("vendor_delivery")
 }
 
+// Admin-managed master list of vendor BUSINESS categories (cuisine / store type)
+// chosen at registration. Owned + migrated by the Admin schema (canonical); this
+// app only reads from it. Distinct from the per-vendor menu `Category` model above.
+model BusinessCategory {
+  id           String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name         String   @unique @db.VarChar(100)
+  isFood       Boolean  @default(true) @map("is_food")
+  displayOrder Int      @default(0) @map("display_order")
+  isActive     Boolean  @default(true) @map("is_active")
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt    DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@map("business_categories")
+  @@schema("vendor_delivery")
+}
+
 model VendorBankDetails {
   id            String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   vendorId      String    @unique @map("vendor_id") @db.Uuid
@@ -358,13 +374,12 @@ model Vendor {
   accountStatus             AccountStatus               @default(PENDING) @map("account_status")
   commissionModel           CommissionModel?            @map("commission_model")
   commissionRate            Decimal                     @default(5.0) @map("commission_rate") @db.Decimal(5, 2)
-  sfxStoreCode              String?                     @map("sfx_store_code") @db.VarChar(100)
   city                      String?                     @db.VarChar(100)
   pincode                   String?                     @db.VarChar(10)
   delivery_provider         String                      @default("SHADOWFAX") @db.VarChar(50)
-  shadowfax_linked          Boolean                     @default(false)
   phoneVerified             Boolean                     @default(false) @map("phone_verified")
   orders                    Order[]
+  byo_templates             byo_templates[]
   categories                Category[]
   productReviewSubmissions  ProductReviewSubmission[]
   productTemplates          ProductTemplate[]
@@ -441,6 +456,7 @@ model AnalyticsEvent {
 model Cart {
   id           String     @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   customerId   String?    @map("customer_id") @db.Uuid
+  guestId      String?    @map("guest_id") @db.VarChar(255)
   vendorId     String     @map("vendor_id") @db.Uuid
   isActive     Boolean    @default(true) @map("is_active")
   expiresAt    DateTime?  @map("expires_at") @db.Timestamptz(6)
@@ -451,6 +467,7 @@ model Cart {
   customer     Customer?  @relation(fields: [customerId], references: [id], onDelete: Cascade)
 
   @@unique([customerId, vendorId])
+  @@unique([guestId, vendorId])
   @@map("carts")
   @@schema("customer")
 }
@@ -651,6 +668,44 @@ model PaymentTransaction {
   @@schema("customer")
 }
 
+// UPI deep-link payment confirmation (no PSP webhook). One row per payment attempt,
+// created when the customer opens a UPI app. The order is created ONLY when this row
+// is authoritatively CONFIRMED (admin reconciliation today, PSP/bank webhook later).
+// Relation-less on purpose (plain FK columns) so it needs no edits to Order/Customer/Vendor.
+model UpiPaymentRequest {
+  id                 String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  tr                 String    @unique @db.VarChar(35)
+  customerId         String?   @map("customer_id") @db.Uuid
+  guestId            String?   @map("guest_id")
+  vendorId           String    @map("vendor_id") @db.Uuid
+  amount             Decimal   @db.Decimal(10, 2)
+  currency           String    @default("INR") @db.VarChar(8)
+  payeeVpa           String    @map("payee_vpa") @db.VarChar(255)
+  upiApp             String?   @map("upi_app") @db.VarChar(40)
+  status             String    @default("PENDING") @db.VarChar(20)
+  clientClaim        String?   @map("client_claim") @db.VarChar(20)
+  claimedUtr         String?   @map("claimed_utr") @db.VarChar(40)
+  confirmedUtr       String?   @map("confirmed_utr") @db.VarChar(40)
+  confirmedAmount    Decimal?  @map("confirmed_amount") @db.Decimal(10, 2)
+  confirmationSource String?   @map("confirmation_source") @db.VarChar(30)
+  confirmedBy        String?   @map("confirmed_by") @db.VarChar(120)
+  confirmedAt        DateTime? @map("confirmed_at") @db.Timestamptz(6)
+  orderId            String?   @map("order_id") @db.Uuid
+  deliveryPreference String?   @map("delivery_preference") @db.VarChar(50)
+  addressId          String?   @map("address_id") @db.Uuid
+  cartId             String?   @map("cart_id") @db.Uuid
+  failureReason      String?   @map("failure_reason")
+  expiresAt          DateTime  @map("expires_at") @db.Timestamptz(6)
+  createdAt          DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt          DateTime  @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@index([status])
+  @@index([vendorId])
+  @@index([customerId])
+  @@map("upi_payment_requests")
+  @@schema("customer")
+}
+
 model SupportRequest {
   id               String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   customerId       String?   @map("customer_id") @db.Uuid
@@ -748,16 +803,30 @@ model SfxRiderLocationLog {
 }
 
 model byo_template_groups {
-  id             String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  template_id    String        @db.Uuid
-  name           String        @db.VarChar(255)
-  selection_type String        @default("SINGLE") @db.VarChar(50)
-  is_required    Boolean       @default(false)
-  max_limit      Int?
-  display_order  Int           @default(0)
-  extra_price    Decimal       @default(0) @db.Decimal(10, 2)
-  free_threshold Int           @default(0)
-  byo_templates  byo_templates @relation(fields: [template_id], references: [id], onDelete: Cascade)
+  id                   String                 @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  template_id          String                 @db.Uuid
+  name                 String                 @db.VarChar(255)
+  selection_type       String                 @default("SINGLE") @db.VarChar(50)
+  is_required          Boolean                @default(false)
+  max_limit            Int?
+  display_order        Int                    @default(0)
+  extra_price          Decimal                @default(0) @db.Decimal(10, 2)
+  free_threshold       Int                    @default(0)
+  byo_templates        byo_templates          @relation(fields: [template_id], references: [id], onDelete: Cascade)
+  byo_template_options byo_template_options[]
+
+  @@schema("vendor_delivery")
+}
+
+model byo_template_options {
+  id                  String              @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  group_id            String              @db.Uuid
+  name                String              @db.VarChar(255)
+  price_modifier      Decimal             @default(0) @db.Decimal(10, 2)
+  is_available        Boolean             @default(true)
+  display_order       Int                 @default(0)
+  image_url           String?
+  byo_template_groups byo_template_groups @relation(fields: [group_id], references: [id], onDelete: Cascade)
 
   @@schema("vendor_delivery")
 }
@@ -769,8 +838,13 @@ model byo_templates {
   created_at                DateTime                    @default(now()) @db.Timestamptz(6)
   updated_at                DateTime                    @default(now()) @db.Timestamptz(6)
   description               String?
+  vendor_id                 String?                     @db.Uuid
+  status                    String                      @default("approved") @db.VarChar(30)
+  rejection_reason          String?
+  is_active                 Boolean                     @default(true)
   byo_template_groups       byo_template_groups[]
   vendor_assigned_templates vendor_assigned_templates[]
+  vendors                   Vendor?                     @relation(fields: [vendor_id], references: [id], onDelete: Cascade)
 
   @@schema("vendor_delivery")
 }

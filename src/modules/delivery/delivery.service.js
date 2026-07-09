@@ -15,105 +15,79 @@ class DeliveryService {
    * @returns {Promise<void>}
    */
   async initiateDelivery(orderId) {
-    if (process.env.USE_SANDBOX_PAYMENTS === 'true' || env.USE_SANDBOX_PAYMENTS) {
-      logger.info(`[DeliveryService] Sandbox mode detected. Creating mock SFX Order and waiting for Vendor.`);
-      
+    // Delivery mode is INDEPENDENT of the payment sandbox (placeholder payments can drive
+    // either a REAL Shadowfax order or the local simulator). See env.SFX_DELIVERY_MODE.
+    if (!env.SFX_LIVE) {
+      logger.info(`[DeliveryService] SIMULATE mode: registering a local SFX order for ${orderId} (no Shadowfax call).`);
+
       const mockSfxId = BigInt(Math.floor(Math.random() * 90000000) + 10000000);
-      const mockCoid = `SFX-MOCK-${orderId.substring(0, 8)}-${new Date().toISOString().slice(0, 10).replace(/-/g, '')}`;
-      
+      const mockCoid = `SFX-SIM-${orderId.substring(0, 8)}-${new Date().toISOString().slice(0, 10).replace(/-/g, '')}`;
+
       try {
         await prisma.sfxOrder.upsert({
           where: { internalOrderId: orderId },
-          update: {
-            sfxOrderId: mockSfxId,
-            sfxStatus: 'ACCEPTED',
-            clientOrderId: mockCoid
-          },
+          update: { sfxOrderId: mockSfxId, sfxStatus: 'ACCEPTED', clientOrderId: mockCoid },
           create: {
             internalOrderId: orderId,
             sfxOrderId: mockSfxId,
-            storeCode: 'DYNAMIC_PICKUP',
+            storeCode: env.SFX_ACTIVE_CLIENT_CODE || 'SIMULATED',
             clientOrderId: mockCoid,
             sfxStatus: 'ACCEPTED'
           }
         });
-        
-        await prisma.order.update({
-          where: { id: orderId },
-          data: { sfxOrderId: mockSfxId }
-        });
-        logger.info(`[DeliveryService] Mock SFX order registered for ${orderId}`);
+        await prisma.order.update({ where: { id: orderId }, data: { sfxOrderId: mockSfxId } });
+        logger.info(`[DeliveryService] Simulated SFX order registered for ${orderId}`);
       } catch (err) {
-        logger.error(`[DeliveryService] Failed to create mock SfxOrder: ${err.message}`);
+        logger.error(`[DeliveryService] Failed to create simulated SfxOrder: ${err.message}`);
       }
       return;
     }
 
-    logger.info(`[DeliveryService] initiateDelivery called for order ${orderId}`);
+    // ── LIVE: place a real Shadowfax Marketplace order ──────────────────────────
+    logger.info(`[DeliveryService] LIVE mode: placing real Shadowfax order for ${orderId}`);
     try {
+      // IDEMPOTENCY GUARD. Shadowfax does NOT dedupe `client_order_id`: re-POSTing the same COID
+      // returns 201 and books a SECOND rider (billed twice). So we never retry order-create —
+      // if this internal order already has an sfx_order, we stop here.
+      const existing = await prisma.sfxOrder.findUnique({ where: { internalOrderId: orderId } });
+      if (existing?.sfxOrderId) {
+        logger.warn(`[DeliveryService] Order ${orderId} already placed (sfx_order_id=${existing.sfxOrderId}); skipping duplicate placement.`);
+        return;
+      }
+
       const order = await prisma.order.findUnique({
         where: { id: orderId },
         include: { items: true, customer: true, vendor: true }
       });
       if (!order) throw new Error('Order not found');
-
-      const placeWithRetry = async (retryCount = 0) => {
-        try {
-          const payload = mapper.buildPlaceOrderPayload(order, order.vendor, order.customer);
-          if (retryCount > 0) {
-             payload.order_details.order_id = `${payload.order_details.order_id}-R${retryCount}`;
-          }
-          
-          const sfxResponse = await shadowfaxService.placeOrder(payload);
-          return { sfxResponse, clientOrderId: payload.order_details.order_id };
-        } catch (error) {
-           if (error.code === 'SFX_DUPLICATE_COID' && retryCount === 0) {
-             const existing = await prisma.sfxOrder.findUnique({ where: { internalOrderId: orderId }});
-             if (existing) {
-               logger.info(`[DeliveryService] Recovered existing SFX order for ${orderId}`);
-               return { 
-                 sfxResponse: { sfx_order_id: existing.sfxOrderId.toString(), status: existing.sfxStatus, track_url: existing.trackUrl },
-                 clientOrderId: existing.clientOrderId
-               };
-             }
-             logger.warn(`[DeliveryService] Duplicate COID, retrying with new suffix for ${orderId}`);
-             return await placeWithRetry(1);
-           }
-           throw error;
-         }
-      };
-
-      const { sfxResponse, clientOrderId } = await placeWithRetry();
-
-      if (sfxResponse && sfxResponse.sfx_order_id) {
-        // Save to sfx_orders
-        await prisma.sfxOrder.upsert({
-          where: { internalOrderId: orderId },
-          update: {
-            sfxOrderId: BigInt(sfxResponse.sfx_order_id),
-            sfxStatus: sfxResponse.status,
-            trackUrl: sfxResponse.track_url || null
-          },
-          create: {
-            internalOrderId: order.id,
-            sfxOrderId: BigInt(sfxResponse.sfx_order_id),
-            storeCode: 'DYNAMIC_PICKUP',
-            clientOrderId: clientOrderId,
-            sfxStatus: sfxResponse.status,
-            trackUrl: sfxResponse.track_url || null
-          }
-        });
-        
-        // Update main order
-        await prisma.order.update({
-          where: { id: order.id },
-          data: { sfxOrderId: BigInt(sfxResponse.sfx_order_id) }
-        });
-        
-        logger.info(`[DeliveryService] successfully initiated delivery for order ${orderId}, sfxOrderId: ${sfxResponse.sfx_order_id}`);
+      if (order.vendor?.latitude == null || order.vendor?.longitude == null) {
+        throw new Error(`Vendor ${order.vendorId} has no coordinates; cannot place a live delivery.`);
       }
+
+      const { payload, clientOrderId } = mapper.buildPlaceOrderPayload(order, order.vendor, order.customer);
+      const sfx = await shadowfaxService.placeOrder(payload);
+
+      await prisma.sfxOrder.create({
+        data: {
+          internalOrderId: order.id,
+          sfxOrderId: BigInt(sfx.sfxOrderId),
+          // Marketplace has no store_code; we keep the account-level client_code in this column.
+          storeCode: env.SFX_ACTIVE_CLIENT_CODE || 'MARKETPLACE',
+          clientOrderId,
+          sfxStatus: sfx.status,
+          trackUrl: sfx.trackUrl,
+          deliveryCost: sfx.deliveryCost
+        }
+      });
+
+      await prisma.order.update({
+        where: { id: order.id },
+        data: { sfxOrderId: BigInt(sfx.sfxOrderId) }
+      });
+
+      logger.info(`[DeliveryService] Live delivery placed for order ${orderId}, sfx_order_id=${sfx.sfxOrderId}`);
     } catch (error) {
-      logger.error(`[DeliveryService] Error initiating delivery for order ${orderId}: ${error.message}`);
+      logger.error(`[DeliveryService] Error initiating live delivery for order ${orderId}: ${error.message}`);
       this._emitAdminError(orderId, error);
       throw error;
     }
@@ -154,9 +128,9 @@ class DeliveryService {
    */
   async onVendorReadyForPickup(orderId) {
     logger.info(`[DeliveryService] onVendorReadyForPickup called for order ${orderId}`);
-    
-    if (process.env.USE_SANDBOX_PAYMENTS === 'true' || env.USE_SANDBOX_PAYMENTS) {
-      logger.info(`[DeliveryService] Sandbox mode: Simulating rider pickup and delivery for ${orderId}`);
+
+    if (!env.SFX_LIVE) {
+      logger.info(`[DeliveryService] SIMULATE mode: driving the rider simulation for ${orderId}`);
       this.startSandboxRiderSimulation(orderId);
       return;
     }
@@ -183,26 +157,41 @@ class DeliveryService {
   /**
    * Processes status updates received via Shadowfax webhooks.
    */
-  async processSfxStatusUpdate({ sfxOrderId, internalStatus, dbCallbackId }) {
-    logger.info(`[DeliveryService] Processing status update for SFX Order ${sfxOrderId} -> ${internalStatus}`);
+  async processSfxStatusUpdate({ sfxOrderId, internalStatus, sfxStatusRaw, rider, dbCallbackId }) {
+    logger.info(`[DeliveryService] Processing status update for SFX Order ${sfxOrderId}: ${sfxStatusRaw || '?'} -> ${internalStatus || '(no internal change)'}`);
     try {
       const sfxOrder = await prisma.sfxOrder.findUnique({
         where: { sfxOrderId: BigInt(sfxOrderId) }
       });
-      
+
       if (!sfxOrder) {
         logger.warn(`[DeliveryService] Could not find internal order mapped to SFX order ${sfxOrderId}`);
         return;
       }
 
-      if (internalStatus) {
-        const OrderService = require('../../../services/orderService');
-        await OrderService.updateOrderStatus(sfxOrder.internalOrderId, internalStatus, 'SYSTEM');
-        
+      // Always record what Shadowfax told us — even when it maps to no internal change
+      // (e.g. ACCEPTED, which means "booked, no rider yet" and must NOT touch Order.status).
+      if (sfxStatusRaw || internalStatus) {
         await prisma.sfxOrder.update({
           where: { internalOrderId: sfxOrder.internalOrderId },
-          data: { sfxStatus: internalStatus }
+          data: { sfxStatus: sfxStatusRaw || internalStatus }
         });
+      }
+
+      if (internalStatus) {
+        const OrderService = require('../../../services/orderService');
+        const updated = await OrderService.updateOrderStatus(sfxOrder.internalOrderId, internalStatus, 'SYSTEM');
+
+        // Re-emit the status WITH rider identity so the customer can show who is delivering
+        // (the OrderService emit above carries no rider; this is idempotent for the UI).
+        if (rider && (rider.name || rider.phone)) {
+          try {
+            const { emitOrderStatusUpdate } = require('../../../lib/socket');
+            emitOrderStatusUpdate(sfxOrder.internalOrderId, internalStatus, 'SYSTEM', updated?.vendorId || null, rider);
+          } catch (emitErr) {
+            logger.warn(`[DeliveryService] Failed to re-emit status with rider: ${emitErr.message}`);
+          }
+        }
       }
 
       if (dbCallbackId) {
@@ -259,6 +248,9 @@ class DeliveryService {
       const vendor = order.vendor;
       const vendorId = order.vendorId;
 
+      // Synthetic rider identity so the customer UI can show a name/phone during simulation.
+      const simRider = { name: 'Ravi (Simulated)', phone: '9999900000', id: 'SIM-RIDER-1' };
+
       // Extract coordinates (default to Delhi coordinates if missing)
       const vendorLat = Number(vendor?.latitude) || 28.6304;
       const vendorLng = Number(vendor?.longitude) || 77.2177;
@@ -305,7 +297,10 @@ class DeliveryService {
 
             logger.info(`[SandboxRider] Order ${orderId} - Step Status: ${step.status}, Location: [${step.lat.toFixed(5)}, ${step.lng.toFixed(5)}], ETA: P:${step.pickupEta} D:${step.dropEta}`);
 
-            // 1. Log Location in DB
+            // 1. Log Location in DB, and persist a callback row shaped exactly like a real
+            //    Shadowfax callback. Sockets only reach clients already listening — a screen
+            //    opened late seeds rider identity from sfx_callbacks (see lib/sfxTracking.js),
+            //    so the simulator must leave the same trail the live integration does.
             try {
               await prisma.sfxRiderLocationLog.create({
                 data: {
@@ -316,8 +311,25 @@ class DeliveryService {
                   dropEta: step.dropEta
                 }
               });
+              await prisma.sfxCallback.create({
+                data: {
+                  sfxOrderId: sfxOrderId,
+                  processed: true,
+                  payload: {
+                    order_status: step.status,
+                    client_order_id: orderId,
+                    rider_name: simRider.name,
+                    rider_contact: simRider.phone,
+                    rider_id: simRider.id,
+                    rider_latitude: step.lat,
+                    rider_longitude: step.lng,
+                    pickup_eta: step.pickupEta,
+                    drop_eta: step.dropEta
+                  }
+                }
+              });
             } catch (dbErr) {
-              logger.error(`[SandboxRider] Failed to log coordinates: ${dbErr.message}`);
+              logger.error(`[SandboxRider] Failed to log coordinates/callback: ${dbErr.message}`);
             }
 
             // 2. If status changes, update database and emit updates
@@ -332,9 +344,11 @@ class DeliveryService {
               });
             }
 
-            // 3. Emit live coordinate updates to all customer and vendor clients via Socket.io namespaces
+            // 3. Emit live coordinate updates. Customer sees location the whole time; the vendor
+            //    only receives coordinates PRE-PICKUP (RIDER_ASSIGNED / RIDER_AT_STORE), then status-only.
             const { emitLocationUpdate } = require('../../../lib/socket');
-            emitLocationUpdate(orderId, step.lat, step.lng, step.pickupEta, step.dropEta, vendorId);
+            const vendorIdForEmit = mapper.isPrePickupInternalStatus(step.status) ? vendorId : null;
+            emitLocationUpdate(orderId, step.lat, step.lng, step.pickupEta, step.dropEta, vendorIdForEmit, simRider);
 
           } catch (stepErr) {
             logger.error(`[SandboxRider] Error in step execution for ${orderId}: ${stepErr.message}`);

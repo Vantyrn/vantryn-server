@@ -1,15 +1,30 @@
 const shadowfaxClient = require('./shadowfaxClient');
 const logger = require('../../../../lib/logger');
 
+/**
+ * Shadowfax HL **Marketplace** API adapter.
+ * Docs: https://sfxhlmarketplaceapi.docs.apiary.io/
+ * Verified live against staging 2026-07-09 — see d:\Vantryn\DELIVERY_SHADOWFAX_INTEGRATION.md
+ *
+ * Endpoints:
+ *   PUT  /api/v1/order-serviceability/          — serviceability + delivery cost
+ *   POST /api/v2/orders/                        — place order  (doc says PUT; PUT returns 405)
+ *   GET  /api/v2/orders/{sfx_order_id}/status/  — status pull
+ *   PUT  /api/v2/orders/{sfx_order_id}/cancel/  — cancel
+ *   PUT  /api/v2/orders/{coid}/dispatch-ready/  — dispatch-ready (keyed by CLIENT order id)
+ *
+ * Auth: `Authorization: Token <token>` (added by shadowfaxClient interceptor).
+ * There is NO store_code in this model — one account-level `client_code`, pickup lat/lng per order.
+ */
+
 const ERROR_CODES = {
   SFX_API_ERROR: 'SFX_API_ERROR',
-  SFX_DUPLICATE_COID: 'SFX_DUPLICATE_COID',
   SFX_CANCEL_FAILED: 'SFX_CANCEL_FAILED',
   SFX_ORDER_REJECTED: 'SFX_ORDER_REJECTED',
   SFX_SERVICE_UNAVAILABLE: 'SFX_SERVICE_UNAVAILABLE',
   SFX_TIMEOUT: 'SFX_TIMEOUT',
   SFX_VALIDATION_ERROR: 'SFX_VALIDATION_ERROR',
-  SFX_INVALID_RESPONSE: 'SFX_INVALID_RESPONSE'
+  SFX_INVALID_RESPONSE: 'SFX_INVALID_RESPONSE',
 };
 
 class AppError extends Error {
@@ -20,107 +35,63 @@ class AppError extends Error {
   }
 }
 
-/**
- * Handle Axios errors consistently
- */
 function handleSfxError(error, context) {
   if (error.response) {
     const status = error.response.status;
-    const sfxMessage = error.response.data?.message || JSON.stringify(error.response.data);
-    
+    const msg = error.response.data?.message || error.response.data?.detail || JSON.stringify(error.response.data);
     let code = ERROR_CODES.SFX_API_ERROR;
-    if (status === 400) {
-      if (sfxMessage.includes('Repeating COID') || sfxMessage.includes('Duplicate COID')) {
-        code = ERROR_CODES.SFX_DUPLICATE_COID;
-      } else if (context === 'cancelOrder') {
-        code = ERROR_CODES.SFX_CANCEL_FAILED;
-      } else {
-        code = ERROR_CODES.SFX_ORDER_REJECTED;
-      }
-    } else if (status >= 500) {
-      code = ERROR_CODES.SFX_SERVICE_UNAVAILABLE;
-    }
-
-    logger.error(`[Shadowfax API] Error in ${context}: ${sfxMessage}`);
-    throw new AppError(`Shadowfax API Error (${context}): ${sfxMessage}`, code, status);
-  } else if (error.code === 'ECONNABORTED') {
-    logger.error(`[Shadowfax API] Timeout in ${context}`);
-    throw new AppError(`Shadowfax request timed out (${context})`, ERROR_CODES.SFX_TIMEOUT, 504);
-  } else {
-    logger.error(`[Shadowfax API] Service unavailable in ${context}: ${error.message}`);
-    throw new AppError(`Shadowfax service unavailable (${context}): ${error.message}`, ERROR_CODES.SFX_SERVICE_UNAVAILABLE, 503);
+    if (status === 400) code = context === 'cancelOrder' ? ERROR_CODES.SFX_CANCEL_FAILED : ERROR_CODES.SFX_ORDER_REJECTED;
+    else if (status >= 500) code = ERROR_CODES.SFX_SERVICE_UNAVAILABLE;
+    logger.error(`[Shadowfax] ${context} failed (${status}): ${msg}`);
+    throw new AppError(`Shadowfax ${context}: ${msg}`, code, status);
   }
+  if (error.code === 'ECONNABORTED') {
+    logger.error(`[Shadowfax] ${context} timed out`);
+    throw new AppError(`Shadowfax ${context} timed out`, ERROR_CODES.SFX_TIMEOUT, 504);
+  }
+  logger.error(`[Shadowfax] ${context} unavailable: ${error.message}`);
+  throw new AppError(`Shadowfax ${context}: ${error.message}`, ERROR_CODES.SFX_SERVICE_UNAVAILABLE, 503);
 }
 
-// Validation Helpers
-const isValidLat = (lat) => typeof lat === 'number' && lat >= -90 && lat <= 90;
-const isValidLng = (lng) => typeof lng === 'number' && lng >= -180 && lng <= 180;
+const isLat = (v) => Number.isFinite(v) && v >= -90 && v <= 90;
+const isLng = (v) => Number.isFinite(v) && v >= -180 && v <= 180;
 
 class ShadowfaxService {
   /**
-   * Check if Shadowfax is serviceable for a given location and value.
-   * Flash Endpoint: POST /order/serviceability/
+   * PUT /api/v1/order-serviceability/
+   * +ve → { serviceable:true, delivery_cost, pickup_eta, drop_eta, approx_distance, rain_surge_amount }
+   * -ve → { serviceable:false, reason }   ← no charges returned
    */
-  async checkServiceability({ pickupDetails, dropDetails, storeCode, orderValue, paid, dropLat, dropLng, coid }) {
-    // Determine dynamic inputs with compatibility checks
-    const pickup = pickupDetails || {
-      building_name: 'Store Vendor',
-      latitude: 0,
-      longitude: 0,
-      address: 'Store Address'
-    };
-
-    const drop = dropDetails || {
-      building_name: 'Customer Apartment',
-      latitude: dropLat || 0,
-      longitude: dropLng || 0,
-      address: 'Customer Address'
-    };
-
-    if (!isValidLat(pickup.latitude) || !isValidLng(pickup.longitude)) {
-      throw new AppError('Invalid pickup coordinates', ERROR_CODES.SFX_VALIDATION_ERROR, 400);
-    }
-    if (!isValidLat(drop.latitude) || !isValidLng(drop.longitude)) {
-      throw new AppError('Invalid drop coordinates', ERROR_CODES.SFX_VALIDATION_ERROR, 400);
-    }
+  async checkServiceability({ pickupLat, pickupLng, dropLat, dropLng, orderValue, paid = true }) {
+    const pLat = Number(pickupLat), pLng = Number(pickupLng);
+    const dLat = Number(dropLat), dLng = Number(dropLng);
+    if (!isLat(pLat) || !isLng(pLng)) throw new AppError('Invalid pickup coordinates', ERROR_CODES.SFX_VALIDATION_ERROR, 400);
+    if (!isLat(dLat) || !isLng(dLng)) throw new AppError('Invalid drop coordinates', ERROR_CODES.SFX_VALIDATION_ERROR, 400);
 
     try {
-      const payload = {
-        pickup_details: {
-          building_name: pickup.building_name || pickup.name || 'Store Vendor',
-          latitude: Number(pickup.latitude),
-          longitude: Number(pickup.longitude),
-          address: pickup.address || 'Store Vendor Address'
-        },
-        drop_details: {
-          building_name: drop.building_name || drop.name || 'Customer Apartment',
-          latitude: Number(drop.latitude),
-          longitude: Number(drop.longitude),
-          address: drop.address || 'Customer Delivery Address'
-        }
-      };
-
-      logger.info(`[Shadowfax Service] Checking serviceability from [${payload.pickup_details.latitude}, ${payload.pickup_details.longitude}] to [${payload.drop_details.latitude}, ${payload.drop_details.longitude}]`);
-      const response = await shadowfaxClient.post('/order/serviceability/', payload);
-      
-      if (!response.data || typeof response.data.is_serviceable === 'undefined') {
-        throw new AppError('Invalid response: missing is_serviceable key', ERROR_CODES.SFX_INVALID_RESPONSE, 502);
+      const { data } = await shadowfaxClient.put('/api/v1/order-serviceability/', {
+        pickup_latitude: String(pLat),
+        pickup_longitude: String(pLng),
+        drop_latitude: String(dLat),
+        drop_longitude: String(dLng),
+        paid: String(Boolean(paid)),
+        order_value: Number(orderValue) || 0,
+        stage_of_check: 'pre_order',
+      });
+      if (!data || typeof data.serviceable === 'undefined') {
+        throw new AppError('Serviceability response missing `serviceable`', ERROR_CODES.SFX_INVALID_RESPONSE, 502);
       }
-      
-      logger.info(`[Shadowfax Service] Serviceability check passed. is_serviceable: ${response.data.is_serviceable}`);
-      
-      // Map to backward compatible and full response formats
+
+      const isServiceable = data.serviceable === true;
+      logger.info(`[Shadowfax] serviceable=${isServiceable} cost=${data.delivery_cost} dist=${data.approx_distance}${isServiceable ? '' : ` reason=${data.reason}`}`);
+
       return {
-        is_serviceable: response.data.is_serviceable,
-        isServiceable: response.data.is_serviceable,
-        total_amount: Number(response.data.total_amount || 0),
-        delivery_cost: Number(response.data.total_amount || 0),
-        rain_rider_incentive: Number(response.data.rain_rider_incentive || 0),
-        high_demand_surge: Number(response.data.high_demand_surge || 0),
-        pickup_eta: response.data.pickup_eta || '15 Mins',
-        eta: response.data.pickup_eta || '15 Mins',
-        available_rider_count: response.data.is_serviceable ? 5 : 0, // compatibility override
-        message: response.data.message
+        isServiceable,
+        deliveryCost: Number(data.delivery_cost || 0) + Number(data.rain_surge_amount || 0),
+        pickupEta: data.pickup_eta ?? null,
+        dropEta: data.drop_eta ?? null,
+        approxDistance: data.approx_distance ?? null,
+        reason: data.reason || null,
       };
     } catch (error) {
       if (error instanceof AppError) throw error;
@@ -129,29 +100,26 @@ class ShadowfaxService {
   }
 
   /**
-   * Place an order with Shadowfax.
-   * Flash Endpoint: POST /order/create/
+   * POST /api/v2/orders/
+   *
+   * ⚠️ Shadowfax does NOT dedupe `client_order_id`: posting the same COID twice returns 201 and
+   * creates a SECOND order (a second rider, billed twice). Callers MUST guarantee one call per
+   * internal order — see delivery.service.js `initiateDelivery`.
    */
   async placeOrder(payload) {
     try {
-      logger.info(`[Shadowfax Service] Placing Flash order.`);
-      const response = await shadowfaxClient.post('/order/create/', payload);
-      
-      if (!response.data || !response.data.is_order_created) {
-        throw new AppError('Order placement was not marked created in response', ERROR_CODES.SFX_INVALID_RESPONSE, 502);
-      }
-      
-      logger.info(`[Shadowfax Service] Order placed successfully. Flash ID: ${response.data.flash_order_id}`);
-      
-      // Map response to match system expectations
+      logger.info(`[Shadowfax] placing order coid=${payload?.order_details?.client_order_id} client_code=${payload?.client_code}`);
+      const { data } = await shadowfaxClient.post('/api/v2/orders/', payload);
+      const d = data?.data;
+      if (!d?.sfx_order_id) throw new AppError('Order create response missing sfx_order_id', ERROR_CODES.SFX_INVALID_RESPONSE, 502);
+
+      logger.info(`[Shadowfax] order created sfx_order_id=${d.sfx_order_id} status=${d.status}`);
       return {
-        sfx_order_id: response.data.flash_order_id,
-        status: 'ALLOTTED',
-        pickup_otp: response.data.pickup_otp,
-        drop_otp: response.data.drop_otp,
-        total_amount: response.data.total_amount,
-        track_url: null,
-        message: response.data.message
+        sfxOrderId: d.sfx_order_id,
+        status: d.status || 'ACCEPTED',
+        deliveryCost: Number(d.delivery_cost || 0),
+        trackUrl: d.track_url && d.track_url !== 'NA' ? d.track_url : null, // staging returns "NA"
+        clientOrderId: d.order_details?.client_order_id ?? payload?.order_details?.client_order_id,
       };
     } catch (error) {
       if (error instanceof AppError) throw error;
@@ -159,64 +127,60 @@ class ShadowfaxService {
     }
   }
 
-  /**
-   * Cancel an existing Shadowfax order.
-   * Flash Endpoint: POST /order/cancel/
-   */
-  async cancelOrder({ sfxOrderId, reason, user }) {
-    if (!sfxOrderId) {
-      throw new AppError('sfxOrderId is required for cancellation', ERROR_CODES.SFX_VALIDATION_ERROR, 400);
-    }
-
+  /** GET /api/v2/orders/{sfx_order_id}/status/ */
+  async getOrderStatus({ sfxOrderId }) {
+    if (!sfxOrderId) throw new AppError('sfxOrderId is required for status pull', ERROR_CODES.SFX_VALIDATION_ERROR, 400);
     try {
-      const payload = {
-        order_id: sfxOrderId.toString()
+      const { data } = await shadowfaxClient.get(`/api/v2/orders/${sfxOrderId}/status/`);
+      const d = data?.data || {};
+      const rd = d.rider_details || {};
+      const loc = rd.rider_location;
+      return {
+        status: d.status,
+        // ⚠️ `rider_location` here is STALE on staging (shared sandbox rider). Live coordinates
+        // arrive ONLY via the rider-location callback — never treat this as a live position.
+        rider: rd.rider_name ? { name: rd.rider_name, phone: rd.rider_phone || null, lat: loc ? Number(loc.latitude) : null, lng: loc ? Number(loc.longitude) : null } : null,
+        raw: d,
       };
-      logger.info(`[Shadowfax Service] Cancelling Flash order ${sfxOrderId}`);
-      const response = await shadowfaxClient.post('/order/cancel/', payload);
-      logger.info(`[Shadowfax Service] Order ${sfxOrderId} cancelled successfully.`);
-      return response.data;
     } catch (error) {
-      handleSfxError(error, 'cancelOrder');
-    }
-  }
-
-  /**
-   * Get real-time order tracking details.
-   * Flash Endpoint: GET /order/track/{order_id}/
-   */
-  async getOrderStatus({ coid, sfxOrderId }) {
-    // Flash uses client order ID (coid) for tracking. Accept both for compatibility.
-    const trackingId = coid || sfxOrderId;
-    if (!trackingId) {
-      throw new AppError('coid or sfxOrderId is required for tracking', ERROR_CODES.SFX_VALIDATION_ERROR, 400);
-    }
-
-    try {
-      logger.info(`[Shadowfax Service] Tracking Flash order: ${trackingId}`);
-      const response = await shadowfaxClient.get(`/order/track/${trackingId}/`);
-      return response.data;
-    } catch (error) {
+      if (error instanceof AppError) throw error;
       handleSfxError(error, 'getOrderStatus');
     }
   }
 
-  /**
-   * Dynamic Flow deprecates static Store registration.
-   */
-  async createStore() {
-    logger.warn('[Shadowfax Service] createStore is deprecated in Flash Hyperlocal dynamic pickup model.');
-    return { store_code: 'DYNAMIC_PICKUP' };
+  /** PUT /api/v2/orders/{sfx_order_id}/cancel/ — `user` ∈ Customer | Seller | Rider */
+  async cancelOrder({ sfxOrderId, reason, user }) {
+    if (!sfxOrderId) throw new AppError('sfxOrderId is required for cancellation', ERROR_CODES.SFX_VALIDATION_ERROR, 400);
+    try {
+      const { data } = await shadowfaxClient.put(`/api/v2/orders/${sfxOrderId}/cancel/`, {
+        reason: String(reason || 'Cancelled by seller').slice(0, 128),
+        user: user || 'Seller',
+      });
+      logger.info(`[Shadowfax] order ${sfxOrderId} cancelled`);
+      return data;
+    } catch (error) {
+      if (error instanceof AppError) throw error;
+      handleSfxError(error, 'cancelOrder');
+    }
   }
 
-  /**
-   * Mark an order as dispatch ready (Deprecated/Stubbed out in dynamic Flash model).
-   */
-  async markDispatchReady() {
-    logger.info('[Shadowfax Service] markDispatchReady stubbed out for Flash.');
-    return { success: true };
+  /** PUT /api/v2/orders/{coid}/dispatch-ready/ — keyed by CLIENT order id, not sfx_order_id. */
+  async markDispatchReady({ coid, shipmentReadyTimestamp }) {
+    if (!coid) throw new AppError('coid is required for dispatch-ready', ERROR_CODES.SFX_VALIDATION_ERROR, 400);
+    try {
+      const { data } = await shadowfaxClient.put(`/api/v2/orders/${coid}/dispatch-ready/`, {
+        shipment_ready_timestamp: shipmentReadyTimestamp || new Date().toISOString().replace(/\.\d+Z$/, 'Z'),
+      });
+      logger.info(`[Shadowfax] dispatch-ready sent for coid=${coid}`);
+      return data;
+    } catch (error) {
+      if (error instanceof AppError) throw error;
+      handleSfxError(error, 'markDispatchReady');
+    }
   }
 }
 
-module.exports = new ShadowfaxService();
-
+const service = new ShadowfaxService();
+service.ERROR_CODES = ERROR_CODES;
+service.AppError = AppError;
+module.exports = service;

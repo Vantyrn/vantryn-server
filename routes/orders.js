@@ -4,8 +4,11 @@ const firebaseAuth = require('../middleware/auth');
 const requireCustomer = require('../middleware/customer');
 const CartService = require('../services/cartService');
 const { prisma } = require('../lib/prisma');
-const shadowfaxService = require('../src/modules/delivery/shadowfax/shadowfax.service');
+const sfxMapper = require('../src/modules/delivery/shadowfax/shadowfax.mapper');
 const env = require('../src/config/env');
+const { assertServiceable } = require('../lib/deliveryCost');
+const { getSfxTracking } = require('../lib/sfxTracking');
+const { isCancellableStatus } = require('../lib/orderStatus');
 
 /**
  * MODULE 5 — ORDER & PAYMENT
@@ -86,52 +89,20 @@ router.post('/checkout', firebaseAuth, requireCustomer, async (req, res) => {
 
     if (!address) return res.status(400).json({ error: 'Valid delivery address required' });
 
-    // SFX Serviceability Check
+    // FIRST gate: is the vendor→customer route serviceable? A "+ve" result returns delivery
+    // charges; a "-ve" result blocks the order. Single source of truth: lib/deliveryCost.
     let deliveryCost = 0;
-    
-    const isSandbox = env.USE_SANDBOX_PAYMENTS || process.env.USE_SANDBOX_PAYMENTS === 'true';
-    console.log(`[CHECKOUT] Sandbox Check: ${isSandbox} (env: ${env.USE_SANDBOX_PAYMENTS}, process: ${process.env.USE_SANDBOX_PAYMENTS})`);
-
-    if (isSandbox) {
-      console.log('[CHECKOUT] Sandbox mode active: Applying mock delivery fee with dynamic weather/demand surges.');
-      const mockRainIncentive = 15.00;
-      const mockDemandSurge = 20.00;
-      const mockBaseCharge = 40.00;
-      deliveryCost = mockBaseCharge + mockRainIncentive + mockDemandSurge;
-    } else {
-      try {
-        const sfxResponse = await shadowfaxService.checkServiceability({
-          pickupDetails: {
-            building_name: vendor.businessName || 'Store Vendor',
-            latitude: vendor.latitude ? Number(vendor.latitude) : 28.6304,
-            longitude: vendor.longitude ? Number(vendor.longitude) : 77.2177,
-            address: vendor.businessAddress || 'Store Address'
-          },
-          dropDetails: {
-            building_name: address.addressType || 'Customer Residence',
-            latitude: address.latitude ? Number(address.latitude) : 28.6448,
-            longitude: address.longitude ? Number(address.longitude) : 77.1873,
-            address: address.addressLine1 || 'Customer Address'
-          },
-          orderValue: cart.total,
-          paid: true
-        });
-        
-        if (sfxResponse && !sfxResponse.isServiceable) {
-          return res.status(422).json({ 
-            error: 'DELIVERY_UNAVAILABLE', 
-            message: 'Delivery is currently unavailable in your area.' 
-          });
-        }
-        
-        if (sfxResponse) {
-          // Dynamic weather and surge charges are added dynamically to the delivery charges
-          deliveryCost = Number(sfxResponse.total_amount || 0) + Number(sfxResponse.rain_rider_incentive || 0) + Number(sfxResponse.high_demand_surge || 0);
-        }
-      } catch (error) {
-        console.warn('[CHECKOUT-DEMO] Serviceability check failed, forcing mock delivery cost of 75 for stability:', error.message);
-        deliveryCost = 75.00;
+    try {
+      ({ deliveryCost } = await assertServiceable({ vendor, address, cartTotal: cart.total, paid: true }));
+    } catch (error) {
+      if (error.code === 'DELIVERY_UNAVAILABLE') {
+        return res.status(422).json({ error: 'DELIVERY_UNAVAILABLE', message: error.message });
       }
+      console.warn('[CHECKOUT] Serviceability check failed:', error.message);
+      return res.status(422).json({
+        error: 'DELIVERY_CHECK_FAILED',
+        message: 'Could not verify delivery serviceability right now. Please try again.'
+      });
     }
 
     // 6. Initiate Payment (Sandbox or Real)
@@ -174,9 +145,10 @@ router.post('/checkout', firebaseAuth, requireCustomer, async (req, res) => {
  */
 router.post('/validate-delivery', firebaseAuth, requireCustomer, async (req, res) => {
   try {
-    const { addressId } = req.body;
-    
-    const cart = await CartService.getCart({ customerId: req.customer.id });
+    const { addressId, vendorId } = req.body;
+
+    // vendorId scopes the lookup to the right cart when the customer has carts with several vendors.
+    const cart = await CartService.getCart({ customerId: req.customer.id }, vendorId);
     if (!cart) return res.status(404).json({ error: 'Cart empty' });
 
     const vendor = await prisma.vendor.findUnique({ where: { id: cart.vendorId } });
@@ -184,53 +156,25 @@ router.post('/validate-delivery', firebaseAuth, requireCustomer, async (req, res
 
     if (!vendor || !address) return res.status(400).json({ error: 'Invalid vendor or address' });
 
-    const isSandbox = env.USE_SANDBOX_PAYMENTS || process.env.USE_SANDBOX_PAYMENTS === 'true';
-    if (isSandbox) {
-      const mockRainIncentive = 15.00;
-      const mockDemandSurge = 20.00;
-      const mockBaseCharge = 40.00;
-      const totalDeliveryFee = mockBaseCharge + mockRainIncentive + mockDemandSurge;
-      return res.json({
-        success: true,
-        isServiceable: true,
-        riderCount: 5,
-        deliveryFee: totalDeliveryFee,
-        eta: '15 Mins'
-      });
-    }
-
     try {
-      const sfxResponse = await shadowfaxService.checkServiceability({
-        pickupDetails: {
-          building_name: vendor.businessName || 'Store Vendor',
-          latitude: vendor.latitude ? Number(vendor.latitude) : 28.6304,
-          longitude: vendor.longitude ? Number(vendor.longitude) : 77.2177,
-          address: vendor.businessAddress || 'Store Address'
-        },
-        dropDetails: {
-          building_name: address.addressType || 'Customer Residence',
-          latitude: address.latitude ? Number(address.latitude) : 28.6448,
-          longitude: address.longitude ? Number(address.longitude) : 77.1873,
-          address: address.addressLine1 || 'Customer Address'
-        },
-        orderValue: cart.total,
-        paid: true
+      const { deliveryCost, pickupEta, dropEta } = await assertServiceable({
+        vendor, address, cartTotal: cart.total, paid: true
       });
-
-      const totalDeliveryFee = Number(sfxResponse.total_amount || 0) + Number(sfxResponse.rain_rider_incentive || 0) + Number(sfxResponse.high_demand_surge || 0);
-
       res.json({
         success: true,
-        isServiceable: sfxResponse.isServiceable,
-        riderCount: sfxResponse.isServiceable ? 5 : 0,
-        deliveryFee: totalDeliveryFee,
-        eta: sfxResponse.eta || null
+        isServiceable: true,
+        deliveryFee: deliveryCost,
+        pickupEta,
+        dropEta,
+        eta: dropEta != null ? `${dropEta} Mins` : '15 Mins'
       });
     } catch (sfxErr) {
-      res.status(422).json({ 
-        success: false, 
-        error: 'DELIVERY_CHECK_FAILED', 
-        message: 'Delivery serviceability validation failed at this time.' 
+      res.status(422).json({
+        success: false,
+        error: sfxErr.code === 'DELIVERY_UNAVAILABLE' ? 'DELIVERY_UNAVAILABLE' : 'DELIVERY_CHECK_FAILED',
+        message: sfxErr.code === 'DELIVERY_UNAVAILABLE'
+          ? sfxErr.message
+          : 'Delivery serviceability validation failed at this time.'
       });
     }
   } catch (error) {
@@ -296,40 +240,18 @@ router.post('/:id/cancel', firebaseAuth, requireCustomer, async (req, res) => {
     });
 
     if (!order) return res.status(404).json({ error: 'Order not found' });
-    
-    const cancellableStatuses = [
-      'pending_vendor', 
-      'accepted', 
-      'preparing', 
-      'ready', 
-      'ready_for_pickup', 
-      'on_the_way_to_pickup', 
-      'arrived_at_pickup'
-    ];
-    if (!cancellableStatuses.includes(order.status)) {
+
+    // Cancellable only before the rider takes the parcel — Shadowfax bills 100% of the
+    // delivery fee for a post-pickup cancellation.
+    if (!isCancellableStatus(order.status)) {
         return res.status(400).json({ error: 'Order cannot be cancelled at this stage' });
     }
 
-    let refundStatus = order.refundStatus;
-    if (Number(order.totalAmount) > 0) {
-        refundStatus = 'PENDING';
-    }
-
-    const updatedOrder = await prisma.order.update({
-        where: { id },
-        data: {
-            status: 'cancelled',
-            refundStatus,
-        }
-    });
-
-    await prisma.orderStatusHistory.create({
-        data: {
-            orderId: id,
-            status: 'cancelled',
-            changedBy: 'CUSTOMER'
-        }
-    });
+    // Route through OrderService: it cancels the Shadowfax delivery, writes status history,
+    // sets refundStatus, and emits sockets + push. A direct prisma.update here would leave a
+    // real rider en route to a cancelled order.
+    const OrderService = require('../services/orderService');
+    const updatedOrder = await OrderService.updateOrderStatus(id, 'cancelled', 'CUSTOMER');
 
     // Notify vendor
     const { getIo } = require('../lib/socket');
@@ -362,25 +284,31 @@ router.get('/:id/tracking', firebaseAuth, requireCustomer, async (req, res) => {
     const { id } = req.params;
     const order = await prisma.order.findUnique({
       where: { id, customerId: req.customer.id },
-      include: { rider: { include: { profile: true } } }
+      include: { vendor: { select: { businessName: true, latitude: true, longitude: true } } }
     });
 
     if (!order) return res.status(404).json({ error: 'Order not found' });
-    if (!order.riderId) return res.status(200).json({ success: true, status: order.status, message: 'Rider not yet assigned' });
 
+    // Delivery telemetry comes from Shadowfax (real or simulated), stored in the sfx_* tables.
+    const { sfxStatus, trackUrl, rider, riderLocation } = await getSfxTracking(id);
+
+    const snap = order.addressSnapshot || {};
     res.json({
       success: true,
       status: order.status,
-      rider: {
-        name: order.rider.fullName,
-        phone: order.rider.profile?.phoneNumber || '',
-        location: {
-          lat: Number(order.rider.latitude),
-          lng: Number(order.rider.longitude)
-        }
-      }
+      sfxStatus,
+      trackUrl,
+      rider,
+      riderLocation,
+      vendorLocation: (order.vendor?.latitude && order.vendor?.longitude)
+        ? { lat: Number(order.vendor.latitude), lng: Number(order.vendor.longitude), name: order.vendor.businessName }
+        : null,
+      destination: (snap.latitude && snap.longitude)
+        ? { lat: Number(snap.latitude), lng: Number(snap.longitude) }
+        : null
     });
   } catch (error) {
+    console.error('[TRACKING] Failed:', error.message);
     res.status(500).json({ error: 'Failed to fetch tracking info' });
   }
 });
