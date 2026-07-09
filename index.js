@@ -6,20 +6,17 @@ require('dotenv').config({ path: _path.resolve(__dirname, '.env') });
 require('dotenv').config({ path: _path.resolve(__dirname, '../.env.server'), override: false });
 require('dotenv').config({ path: _path.resolve(__dirname, '../.env'), override: false });
 
-// Central observability (workflow §4.5) — initialize error tracking as early as
-// possible, then bring up the structured logger + request correlation.
-const { initSentry, captureException } = require('./lib/sentry');
-initSentry();
-const logger = require('./lib/logger');
-const requestContext = require('./middleware/requestContext');
-
-// Loud boot-time env assertions — refuse to run insecurely (footgun #7).
-require('./lib/checkEnv')();
-
-const express = require('express'); // Ping for redeploy
+// ==========================================
+// STAGE 0: BIND THE PORT FIRST (health-check-safe boot)
+// ==========================================
+// Railway hits /health and fails the deploy if the port never opens. So we
+// create the server, register /health, and start listening BEFORE any fallible
+// initialization (Sentry, logger, env checks, heavy modules). If anything below
+// throws or a secret is misconfigured, the container still binds $PORT and the
+// real error appears in the deploy logs instead of a silent "never became
+// healthy" crash-loop.
+const express = require('express');
 const http = require('http');
-const cors = require('cors');
-const helmet = require('helmet');
 
 const app = express();
 app.set('etag', false); // Disable ETags to prevent React Native 304 caching bugs
@@ -28,23 +25,47 @@ app.set('etag', false); // Disable ETags to prevent React Native 304 caching bug
 app.set('trust proxy', 1);
 const server = http.createServer(app);
 
-const { authLimiter, paymentLimiter, apiLimiter } = require('./lib/rateLimiters');
-
-// REQUEST CORRELATION + STRUCTURED LOGGING (highest priority — opens the
-// AsyncLocalStorage scope so every downstream log carries requestId/userId/orderId).
-app.use(requestContext);
-
+// Railway injects PORT; fall back to 3000 for local runs.
 const PORT = process.env.PORT || 3000;
 
-// ==========================================
-// STAGE 1: IMMEDIATE BINDING
-// ==========================================
-// We start listening IMMEDIATELY to pass Railway's health check.
-// Heavy routes and services will load in the background.
+// Health check (root + /api/health) — registered before we listen so it is the
+// very first thing the platform can reach.
+const healthHandler = (req, res) => res.status(200).json({
+  status: 'live',
+  timestamp: new Date().toISOString(),
+  env: process.env.NODE_ENV,
+  uptime: process.uptime(),
+});
+app.get('/health', healthHandler);
+app.get('/api/health', healthHandler);
+
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 [STAGE 1] Server running on http://0.0.0.0:${PORT}`);
   console.log(`🌐 [HEALTH] Health check available at /health`);
 });
+
+// ==========================================
+// STAGE 1: OBSERVABILITY + SECURITY GATES
+// ==========================================
+// Central observability (workflow §4.5) — error tracking, structured logger,
+// request correlation. Loaded AFTER the port is open so a load-time failure
+// here can't stop the healthcheck from passing.
+const { initSentry, captureException } = require('./lib/sentry');
+initSentry();
+const logger = require('./lib/logger');
+const requestContext = require('./middleware/requestContext');
+
+// Loud boot-time env assertions — refuse to run insecurely (footgun #7).
+require('./lib/checkEnv')();
+
+const cors = require('cors');
+const helmet = require('helmet');
+const { authLimiter, paymentLimiter, apiLimiter } = require('./lib/rateLimiters');
+
+// REQUEST CORRELATION + STRUCTURED LOGGING (highest priority among request
+// middleware — opens the AsyncLocalStorage scope so every downstream log carries
+// requestId/userId/orderId).
+app.use(requestContext);
 
 // ==========================================
 // STAGE 2: MIDDLEWARE & CONFIG
@@ -109,16 +130,7 @@ app.use('/api', apiLimiter);
 
 console.log('🚀 [STAGE 2] Basic middleware initialized.');
 
-// Health Check (Both root and /api/health)
-const healthHandler = (req, res) => res.status(200).json({ 
-  status: 'live', 
-  timestamp: new Date().toISOString(),
-  env: process.env.NODE_ENV,
-  uptime: process.uptime()
-});
-
-app.get('/health', healthHandler);
-app.get('/api/health', healthHandler);
+// (Health check is registered up top in STAGE 0, before the port is bound.)
 
 // ==========================================
 // STAGE 2.5: FIREBASE ADMIN INIT
