@@ -4,6 +4,12 @@ const env = require('../../config/env');
 const logger = require('../../../lib/logger');
 const { prisma } = require('../../../lib/prisma');
 
+// Sandbox rider simulation pacing. Default 3× the base delays (~2 min end-to-end)
+// so each phase (assigned → at store → picked up → arrived → delivered) is long
+// enough to observe and switch between the customer/vendor apps. Tune via
+// SFX_SIM_SCALE (e.g. 4-5 for slower, 1 for the original ~38s).
+const SIM_SCALE = Number(process.env.SFX_SIM_SCALE) || 3;
+
 /**
  * Orchestration layer for Delivery operations.
  * Isolates the core modules (Orders, Vendors) from the specific 3PL implementation (Shadowfax).
@@ -353,7 +359,7 @@ class DeliveryService {
           } catch (stepErr) {
             logger.error(`[SandboxRider] Error in step execution for ${orderId}: ${stepErr.message}`);
           }
-        }, step.delay);
+        }, step.delay * SIM_SCALE);
       }
 
     } catch (err) {

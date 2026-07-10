@@ -12,11 +12,17 @@ const { prisma } = require('../lib/prisma');
 router.post('/:id', firebaseAuth, requireCustomer, async (req, res) => {
   try {
     const { id: orderId } = req.params;
-    const { rating, comment } = req.body;
+    // orderRating = food/vendor rating (drives the vendor's average); deliveryRating
+    // = the delivery experience, stored separately. Back-compat: old clients sent `rating`.
+    const { orderRating, deliveryRating, comment } = req.body;
+    const rating = orderRating != null ? orderRating : req.body.rating;
 
-    // 1. Validate Rating
+    // 1. Validate ratings
     if (!rating || rating < 1 || rating > 5) {
-      return res.status(400).json({ error: 'Rating must be between 1 and 5 stars' });
+      return res.status(400).json({ error: 'Order rating must be between 1 and 5 stars' });
+    }
+    if (deliveryRating != null && (deliveryRating < 1 || deliveryRating > 5)) {
+      return res.status(400).json({ error: 'Delivery rating must be between 1 and 5 stars' });
     }
 
     // 2. Validate Comment length
@@ -51,6 +57,7 @@ router.post('/:id', firebaseAuth, requireCustomer, async (req, res) => {
           orderId,
           customerId: req.customer.id,
           rating: parseInt(rating),
+          deliveryRating: deliveryRating != null ? parseInt(deliveryRating) : null,
           comment
         }
       });
