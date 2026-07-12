@@ -135,24 +135,12 @@ router.put('/profile', firebaseAuth, requireCustomer, async (req, res) => {
       });
     }
 
-    // Sync FCM or Expo Push Token to Profile safely without setting the other to null
+    // Sync FCM token to Profile (no pushToken column exists — writing it is a
+    // Prisma "Unknown argument" crash; Expo tokens are intentionally dropped)
     const updateData = {};
-    if (fcmToken !== undefined) {
-      updateData.fcmToken = fcmToken;
-    }
-    if (pushToken !== undefined) {
-      updateData.pushToken = pushToken;
-    }
-    
-    // Fallback: If only a single active token was provided through a generic key, determine what it is
-    const activeToken = fcmToken || pushToken;
-    if (activeToken && Object.keys(updateData).length === 0) {
-      const isExpo = activeToken.startsWith('ExponentPushToken[');
-      if (isExpo) {
-        updateData.pushToken = activeToken;
-      } else {
-        updateData.fcmToken = activeToken;
-      }
+    const activeToken = fcmToken !== undefined ? fcmToken : pushToken;
+    if (activeToken !== undefined && !String(activeToken || '').startsWith('ExponentPushToken[')) {
+      updateData.fcmToken = activeToken;
     }
 
     if (Object.keys(updateData).length > 0 && req.customer.profileId) {

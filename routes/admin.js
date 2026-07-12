@@ -245,33 +245,24 @@ router.post('/broadcast-notification', requireAdmin, async (req, res) => {
       return res.status(400).json({ error: 'Invalid audience. Must be VENDORS, CUSTOMERS, or ALL' });
     }
 
-    if (!title || !message) {
-      return res.status(400).json({ error: 'Title and message are required' });
+    // Admin UI treats message as optional — only title is required.
+    if (!title) {
+      return res.status(400).json({ error: 'Title is required' });
     }
 
-    // Calculate total targeted users (those with registered tokens)
+    // Calculate total targeted users (those with registered tokens).
+    // Delivery is FCM-only: there is no pushToken column (querying it was a
+    // Prisma "Unknown argument" crash that 500'd every broadcast).
     let totalTargeted = 0;
     if (audience === 'VENDORS' || audience === 'ALL') {
       const vendorCount = await prisma.profile.count({
-        where: {
-          role: 'VENDOR',
-          OR: [
-            { fcmToken: { not: null } },
-            { pushToken: { not: null } }
-          ]
-        }
+        where: { role: 'VENDOR', fcmToken: { not: null } }
       });
       totalTargeted += vendorCount;
     }
     if (audience === 'CUSTOMERS' || audience === 'ALL') {
       const customerCount = await prisma.profile.count({
-        where: {
-          role: 'CUSTOMER',
-          OR: [
-            { fcmToken: { not: null } },
-            { pushToken: { not: null } }
-          ]
-        }
+        where: { role: 'CUSTOMER', fcmToken: { not: null } }
       });
       totalTargeted += customerCount;
     }
@@ -287,14 +278,14 @@ router.post('/broadcast-notification', requireAdmin, async (req, res) => {
     // Use uppercase ADMIN_BROADCAST to match client-side notification handler type check
     const result = await fcm.broadcastToUsers(audience, {
       title,
-      body: message,
+      body: message || '',
       type: 'ADMIN_BROADCAST',
       data: { ...(dataPayload || {}), type: 'ADMIN_BROADCAST', channelId: 'admin' }
     });
 
     res.json({
       success: true,
-      message: `Broadcast sent to ${result.success}/${result.success + result.failure} devices (${result.fcmCount} via FCM, ${result.expoCount} via Expo)`,
+      message: `Broadcast sent to ${result.success}/${result.success + result.failure} devices via FCM`,
       result
     });
   } catch (error) {
