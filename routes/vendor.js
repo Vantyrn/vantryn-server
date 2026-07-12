@@ -853,14 +853,12 @@ router.put('/profile', firebaseAuth, async (req, res) => {
     }
 
 
-    // Update Profile FCM Token & Push Token too
-    if (fcmToken || pushToken) {
+    // Update Profile FCM token (no pushToken column exists — writing it is a
+    // Prisma "Unknown argument" crash; Expo tokens are intentionally dropped)
+    if (fcmToken) {
       await withRetry(() => prisma.profile.update({
         where: { id: profile.id },
-        data: {
-          ...(fcmToken ? { fcmToken } : {}),
-          ...(pushToken ? { pushToken } : {})
-        }
+        data: { fcmToken }
       }));
     }
 
