@@ -15,6 +15,31 @@ router.post('/sync', firebaseAuth, async (req, res) => {
     // Handle cases where social login has no phone number
     const safePhone = phoneNumber || null;
 
+    // UNIQUENESS GUARD: a phone and an email each map to exactly ONE vendor. Owning the
+    // phone (proved by OTP) lets a vendor resume their own account, but the email must
+    // belong to that SAME vendor — and vice-versa. Reject mismatches with a clear 409
+    // BEFORE any adoption/upsert mutates state. The @unique constraints on
+    // profiles.phone_number and vendors.email still backstop races.
+    const cleanEmail = email ? email.trim().toLowerCase() : null;
+    const emailVendor = cleanEmail
+      ? await withRetry(() => prisma.vendor.findFirst({ where: { email: cleanEmail } }))
+      : null;
+    const phoneOwner = safePhone
+      ? await withRetry(() => prisma.profile.findFirst({ where: { phoneNumber: safePhone }, include: { vendor: true } }))
+      : null;
+    const phoneVendor = phoneOwner?.vendor || null;
+
+    // Email is taken by a vendor that isn't the one this phone belongs to.
+    if (emailVendor && (!phoneVendor || phoneVendor.id !== emailVendor.id)) {
+      return res.status(409).json({ success: false, code: 'identity_conflict',
+        error: 'This email is already registered to another vendor. Please contact support.' });
+    }
+    // This phone's vendor already exists with a different email.
+    if (!emailVendor && cleanEmail && phoneVendor?.email && phoneVendor.email !== cleanEmail) {
+      return res.status(409).json({ success: false, code: 'identity_conflict',
+        error: 'This phone number is already registered to another vendor with a different email. Please contact support.' });
+    }
+
     // IDENTITY ADOPTION: if a profile already exists for this phone under a DIFFERENT
     // Firebase UID (admin-created vendor, a prior session, or an app reinstall), relink
     // it to this UID. Phone-OTP proves ownership, so this is safe — and it prevents the
