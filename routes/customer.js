@@ -3,6 +3,7 @@ const router = express.Router();
 const firebaseAuth = require('../middleware/auth');
 const requireCustomer = require('../middleware/customer');
 const { prisma, withRetry, getOrCreateCustomerProfile } = require('../lib/prisma');
+const { claimPushToken } = require('../lib/pushToken');
 
 /**
  * MODULE 4 — AGE VERIFICATION (DOB-based, no document upload)
@@ -144,10 +145,10 @@ router.put('/profile', firebaseAuth, requireCustomer, async (req, res) => {
     }
 
     if (Object.keys(updateData).length > 0 && req.customer.profileId) {
-      await prisma.profile.update({
-        where: { id: req.customer.profileId },
-        data: updateData
-      });
+      // Take exclusive ownership of the device token — see lib/pushToken.js. A shared
+      // phone otherwise leaves the token on a previous account, which then receives
+      // this device's notifications.
+      await claimPushToken(req.user.uid, updateData.fcmToken);
       console.log(`[CUSTOMER] Notification tokens updated for ${req.customer.id}:`, updateData);
     }
     // Return both `customer` and `profile` so any client shape works.

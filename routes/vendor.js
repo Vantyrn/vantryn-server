@@ -16,6 +16,7 @@ const { orderSlaQueue } = require('../lib/bullmq');
 const { emitOrderStatusUpdate, emitVendorStatusUpdate } = require('../lib/socket');
 const { getPresignedUploadUrl } = require('../lib/storage');
 const { checkAndTransitionVendorOffline } = require('../lib/vendorStatusHelper');
+const { claimPushToken, releasePushToken } = require('../lib/pushToken');
 
 // Menu categories are PER-VENDOR (Category.vendorId, and the listing filters
 // vendorId = mine OR null), but the database still carries a GLOBAL unique index on
@@ -55,6 +56,43 @@ router.get('/health-check', (req, res) => {
   });
 });
 
+// Vendor logout — the server side of signing out, which did not exist before.
+// Logging out was purely client-side (Firebase signOut + clearing AsyncStorage), so the
+// server never learned about it and two things went wrong:
+//   1. the device's FCM token stayed attached to the profile, so the next order for that
+//      vendor pushed "New order received" to whoever was logged in on that phone next;
+//   2. onlineStatus stayed 'online', so a store nobody was watching kept appearing open
+//      to customers and accepting orders.
+// NOTE: this is deliberately tied to an explicit logout, NOT to socket disconnect —
+// auto-offline on disconnect is off on purpose (see lib/socket.js) because backgrounding
+// the app was falsely closing live stores.
+router.post('/logout', firebaseAuth, async (req, res) => {
+  try {
+    const uid = req.user.uid;
+    const profile = await prisma.profile.findUnique({
+      where: { firebaseUid: uid },
+      include: { vendor: { select: { id: true, onlineStatus: true } } },
+    });
+
+    await releasePushToken(uid);
+
+    if (profile?.vendor && profile.vendor.onlineStatus !== 'offline') {
+      await prisma.vendor.update({
+        where: { id: profile.vendor.id },
+        data: { onlineStatus: 'offline' },
+      });
+      // Tell customers the store just closed so it disappears from browsing immediately.
+      try { emitVendorStatusUpdate(profile.vendor.id, false); } catch (_) {}
+    }
+
+    res.json({ success: true });
+  } catch (error) {
+    // Never block a logout on server cleanup — the client signs out regardless.
+    console.warn('[VENDOR] Logout cleanup failed:', error.message);
+    res.json({ success: true, cleaned: false });
+  }
+});
+
 // Save vendor push/FCM notification tokens
 // Accepts both Expo pushToken and native FCM fcmToken
 router.post('/push-token', firebaseAuth, async (req, res) => {
@@ -71,15 +109,9 @@ router.post('/push-token', firebaseAuth, async (req, res) => {
     // Prisma "Unknown argument pushToken" 500). Fall back to the Expo token only if no
     // native FCM token was provided, so we still store *something* usable.
     const tokenToStore = fcmToken || pushToken;
-    const updateData = {};
-    if (tokenToStore) updateData.fcmToken = tokenToStore;
-
-    if (Object.keys(updateData).length > 0) {
-      await prisma.profile.update({
-        where: { firebaseUid: uid },
-        data: updateData,
-      });
-    }
+    // claimPushToken, not a plain update: the token must belong to exactly one profile,
+    // or a push for the previous account lands on whoever is logged in now.
+    await claimPushToken(uid, tokenToStore);
     console.log(`[PUSH-TOKEN] Saved token for UID ${uid}: fcmToken=${!!tokenToStore}`);
     res.json({ success: true });
   } catch (error) {
@@ -886,10 +918,7 @@ router.put('/profile', firebaseAuth, async (req, res) => {
     // Update Profile FCM token (no pushToken column exists — writing it is a
     // Prisma "Unknown argument" crash; Expo tokens are intentionally dropped)
     if (fcmToken) {
-      await withRetry(() => prisma.profile.update({
-        where: { id: profile.id },
-        data: { fcmToken }
-      }));
+      await withRetry(() => claimPushToken(profile.firebaseUid, fcmToken));
     }
 
     if (bankData && bankData.accountNumber) {
