@@ -63,7 +63,13 @@ class DeliveryService {
 
       const order = await prisma.order.findUnique({
         where: { id: orderId },
-        include: { items: true, customer: true, vendor: true }
+        // profile is required: the pickup/drop contact numbers live on Profile.phoneNumber,
+        // not on Vendor/Customer. Without it the mapper books with a placeholder number.
+        include: {
+          items: true,
+          customer: { include: { profile: { select: { phoneNumber: true } } } },
+          vendor: { include: { profile: { select: { phoneNumber: true } } } },
+        }
       });
       if (!order) throw new Error('Order not found');
       if (order.vendor?.latitude == null || order.vendor?.longitude == null) {

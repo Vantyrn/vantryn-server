@@ -6,7 +6,15 @@
 
 const env = require('../../../config/env');
 
-const cleanPhone = (v) => (v ? String(v).replace(/[^0-9]/g, '').slice(-10) : '9999999999');
+// The 9999999999 fallback is a last resort so a booking is never rejected outright for a
+// missing field — but a rider dialling it reaches nobody, so make it LOUD instead of silent.
+const cleanPhone = (v, who = 'contact') => {
+  if (!v) {
+    console.warn(`[SFX-MAPPER] No phone for ${who} — booking with the unreachable 9999999999 placeholder.`);
+    return '9999999999';
+  }
+  return String(v).replace(/[^0-9]/g, '').slice(-10);
+};
 const numOr = (v, d = 0) => (v == null || Number.isNaN(Number(v)) ? d : Number(v));
 
 /**
@@ -43,17 +51,26 @@ function buildPlaceOrderPayload(internalOrder, vendor, customer) {
       paid: isPrepaid ? 'true' : 'false', // Shadowfax expects the STRING "true"/"false"
       rts_required: true,
     },
+    // Contact numbers live on the linked Profile, NOT on Vendor/Customer (neither model
+    // has a `phone` field), and the address snapshot stores contactPhone/contactName —
+    // not phone/name. Every one of those reads was undefined, so every real booking went
+    // out with the 9999999999 placeholder for BOTH ends and no rider could ever call.
     pickup_details: {
       name: vendor?.businessName || 'Store',
-      contact_number: cleanPhone(vendor?.phone),
+      contact_number: cleanPhone(vendor?.profile?.phoneNumber, 'pickup/vendor'),
       address: vendor?.businessAddress || 'Store address',
-      city: vendor?.city || '',
+      // Vendors have no city recorded; for a hyperlocal drop the customer's city is the
+      // same one, and an empty city risks the booking being rejected outright.
+      city: vendor?.city || snap.city || '',
       latitude: numOr(vendor?.latitude),
       longitude: numOr(vendor?.longitude),
     },
     drop_details: {
-      name: customer?.fullName || snap.name || 'Customer',
-      contact_number: cleanPhone(snap.phone || customer?.phone),
+      name: snap.contactName || customer?.fullName || snap.name || 'Customer',
+      contact_number: cleanPhone(
+        snap.contactPhone || snap.phone || customer?.profile?.phoneNumber,
+        'drop/customer'
+      ),
       address: snap.addressLine1 || snap.address || 'Customer delivery address',
       city: snap.city || vendor?.city || '',
       latitude: numOr(snap.latitude),

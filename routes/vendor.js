@@ -1038,14 +1038,39 @@ router.put('/orders/:id/reject', firebaseAuth, requireKyc, async (req, res) => {
     const OrderService = require('../services/orderService');
     await OrderService.updateOrderStatus(id, 'cancelled_by_vendor', 'VENDOR');
 
-    // Update with specific reasons (since updateOrderStatus handles the generic status)
-    await prisma.order.update({
-      where: { id },
+    // Record WHY on VendorOrderAction — the model that actually has these fields.
+    // This used to write cancellationReason/cancellationNote onto Order, which has
+    // neither, so Prisma threw "Unknown argument" AFTER the order and its Shadowfax
+    // delivery had already been cancelled: the vendor saw "Error rejecting order",
+    // the reason was lost, and the auto-offline check below never ran.
+    // The app sends display strings ('Store closed', 'Other: <text>'), the column is
+    // an enum, so map them; anything unrecognised is OTHER with the text kept as the note.
+    const rawReason = String(reason || '').trim();
+    const REJECT_REASON_ENUM = {
+      'store closed': 'STORE_CLOSED',
+      'kitchen closed': 'KITCHEN_CLOSED',
+      'item(s) unavailable': 'ITEMS_UNAVAILABLE',
+      'unable to fulfill order': 'UNABLE_TO_FULFILL',
+      'staff unavailable': 'STAFF_UNAVAILABLE',
+      'technical issue': 'TECHNICAL_ISSUE',
+    };
+    const VALID_REASONS = Object.values(REJECT_REASON_ENUM).concat('OTHER');
+    const rejectionReason =
+      REJECT_REASON_ENUM[rawReason.toLowerCase()] ||
+      (VALID_REASONS.includes(rawReason.toUpperCase()) ? rawReason.toUpperCase() : 'OTHER');
+
+    // Non-fatal: the order is already cancelled, so failing to write the audit row
+    // must not hand the vendor a 500 for an action that actually succeeded.
+    await prisma.vendorOrderAction.create({
       data: {
-        cancellationReason: reason,
-        cancellationNote: otherNotes || null
+        orderId: id,
+        vendorId: profile.vendor.id,
+        action: 'REJECT',
+        rejectionReason,
+        rejectionNote: otherNotes || (rejectionReason === 'OTHER' ? rawReason || null : null),
+        newStatus: 'cancelled_by_vendor',
       }
-    });
+    }).catch((e) => console.warn('[VENDOR] Could not record rejection reason:', e.message));
 
     // Check if vendor should automatically go offline
     await checkAndTransitionVendorOffline(profile.vendor.id);
@@ -1934,7 +1959,16 @@ router.put('/products/:id', firebaseAuth, requireKyc, async (req, res) => {
 });
 
 // DEV ONLY: Admin approval simulation
-router.put('/products/:id/approve-dev', firebaseAuth, async (req, res) => {
+// DEV-ONLY guard. Both endpoints below let the CALLER name any vendor/product id and
+// flip its approval state, with no ownership and no admin check — mounted unconditionally
+// they let any logged-in user approve any vendor and bypass KYC review entirely. Gated on
+// the existing DEV_BYPASS flag, which lib/checkEnv.js refuses to boot with in production.
+const devOnly = (req, res, next) => {
+  if (process.env.DEV_BYPASS !== 'on') return res.status(404).json({ error: 'Not found' });
+  next();
+};
+
+router.put('/products/:id/approve-dev', devOnly, firebaseAuth, async (req, res) => {
   try {
     const { id } = req.params;
     const { status } = req.body; // approved, rejected, etc.
@@ -1954,7 +1988,7 @@ router.put('/products/:id/approve-dev', firebaseAuth, async (req, res) => {
 
 
 // DEV ONLY: Admin approval simulation for vendor account
-router.put('/admin-simulate/approve-vendor/:id', firebaseAuth, async (req, res) => {
+router.put('/admin-simulate/approve-vendor/:id', devOnly, firebaseAuth, async (req, res) => {
   try {
     const { id } = req.params;
     const { status } = req.body; // approved, rejected, suspended, etc.

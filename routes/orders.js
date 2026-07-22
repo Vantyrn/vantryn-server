@@ -115,7 +115,7 @@ router.post('/checkout', firebaseAuth, requireCustomer, async (req, res) => {
       clientSecret: 'mock_secret_123',
     };
 
-    if (env.USE_SANDBOX_PAYMENTS) {
+    if (env.SANDBOX_PAYMENTS) {
       const sandboxPaymentService = require('../services/sandboxPaymentService');
       const sandboxIntent = sandboxPaymentService.createPaymentIntent(
         cart.total + deliveryCost,

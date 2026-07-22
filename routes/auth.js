@@ -242,22 +242,28 @@ router.post('/verify-phone-payout', firebaseAuth, async (req, res) => {
       return res.status(400).json({ error: 'Only vendor accounts can complete phone verification.' });
     }
 
+    // This is the POST-approval payout step, so it may only CONFIRM an activation an
+    // admin already granted — it must never grant one. It previously set
+    // accountStatus:'ACTIVE' for any caller holding a vendor profile, and
+    // middleware/kyc.js treats ACTIVE as approved, so an unreviewed vendor could
+    // self-approve with a single request and start taking real orders.
+    const alreadyApproved = ['APPROVED', 'ACTIVE'].includes(profile.vendor.accountStatus);
+
     // 2. Perform Single Atomic Transaction to lock phone number verification
     const updatedVendor = await prisma.$transaction(async (tx) => {
-      // Set phoneVerified to true and accountStatus to ACTIVE
       const v = await tx.vendor.update({
         where: { id: profile.vendor.id },
-        data: { 
+        data: {
           phoneVerified: true,
-          accountStatus: 'ACTIVE'
+          ...(alreadyApproved ? { accountStatus: 'ACTIVE' } : {})
         }
       });
 
       // Keep Profile table synchronized and update phoneNumber if passed
       await tx.profile.update({
         where: { id: profile.id },
-        data: { 
-          profileStatus: 'READY',
+        data: {
+          ...(alreadyApproved ? { profileStatus: 'READY' } : {}),
           phoneNumber: phoneNumber ? phoneNumber : undefined
         }
       });
@@ -267,11 +273,14 @@ router.post('/verify-phone-payout', firebaseAuth, async (req, res) => {
 
     console.log(`[AUTH] Phone payout verification successful for Vendor: ${profile.vendor.id}, Phone: ${phoneNumber || profile.phoneNumber}`);
 
+    // Report the REAL status. Hardcoding 'READY' told an unapproved vendor's app it
+    // was approved, and the app writes this straight into its auth store — it would
+    // route them to the dashboard while every API call still 403'd.
     res.json({
       success: true,
       message: 'Phone number verified for payouts successfully.',
       phoneVerified: true,
-      profileStatus: 'READY'
+      profileStatus: alreadyApproved ? 'READY' : (profile.profileStatus || 'UNDER_REVIEW')
     });
 
   } catch (error) {

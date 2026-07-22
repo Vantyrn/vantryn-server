@@ -13,7 +13,18 @@ const config = {
   SFX_REQUEST_TIMEOUT_MS: parseInt(process.env.SFX_REQUEST_TIMEOUT_MS || '10000', 10),
   SFX_RETRY_ATTEMPTS: parseInt(process.env.SFX_RETRY_ATTEMPTS || '3', 10),
   NODE_ENV: process.env.NODE_ENV || 'development',
-  USE_SANDBOX_PAYMENTS: process.env.USE_SANDBOX_PAYMENTS === 'true' || (process.env.NODE_ENV !== 'production'),
+  // ONE definition for "accept test payments". This used to be two separate switches
+  // under two different names — routes/orders.js minted the intent off
+  // USE_SANDBOX_PAYMENTS==='true' while routes/payments.js accepted it off
+  // SANDBOX_PAYMENTS==='on'. Both default true outside production, so it looked fine;
+  // the moment NODE_ENV=production with only one of them set, checkout broke completely
+  // (unset both → a non-sandbox intent hits the Razorpay branch with no signature → 400;
+  // set only USE_SANDBOX_PAYMENTS → a sandbox intent is minted then refused → 403).
+  // Both spellings are accepted so whichever is already set in the deploy keeps working.
+  SANDBOX_PAYMENTS:
+    process.env.SANDBOX_PAYMENTS === 'on' ||
+    process.env.USE_SANDBOX_PAYMENTS === 'true' ||
+    process.env.NODE_ENV !== 'production',
 
   // Delivery mode is INDEPENDENT of the payment sandbox. This lets us run
   // "placeholder payment + REAL Shadowfax" or "placeholder payment + local simulator":
