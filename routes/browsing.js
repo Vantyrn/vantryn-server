@@ -228,7 +228,10 @@ router.get('/vendors/:id/reviews', guestSession, async (req, res) => {
     const reviews = await prisma.feedback.findMany({
       where: { order: { vendorId: id } },
       include: {
-        customer: { select: { name: true } }
+        // fullName, not name — Customer has no `name` field, so this select threw on
+        // every request and the catch turned it into a blanket 500: the reviews tab
+        // has never once rendered, even with feedback rows present.
+        customer: { select: { fullName: true } }
       },
       orderBy: { submittedAt: 'desc' }
     });
