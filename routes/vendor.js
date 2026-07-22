@@ -9,7 +9,7 @@ router.use((req, res, next) => {
 const firebaseAuth = require('../middleware/auth');
 const requireKyc = require('../middleware/kyc');
 const { prisma, withRetry } = require('../lib/prisma');
-const { ACTIVE_ORDER_STATUSES, isCancellableStatus } = require('../lib/orderStatus');
+const { ACTIVE_ORDER_STATUSES, isTerminalStatus, isCancellableStatus } = require('../lib/orderStatus');
 
 const fcm = require('../lib/fcm');
 const { orderSlaQueue } = require('../lib/bullmq');
@@ -1203,6 +1203,22 @@ router.post('/orders/:id/notify-customer', firebaseAuth, requireKyc, async (req,
 
     if (!order || !order.customer?.profile?.firebaseUid) {
       return res.status(404).json({ error: 'Customer not found or not registered for notifications' });
+    }
+
+    // This endpoint had NO guards at all: any KYC-approved vendor could push an arbitrary
+    // title/body to any customer for any order id they knew.
+    if (!req.profile?.vendor || order.vendorId !== req.profile.vendor.id) {
+      return res.status(403).json({ error: 'This order does not belong to your store.' });
+    }
+
+    // And a finished order must not generate customer updates. An order auto-cancelled for
+    // an SLA breach still offered "Food Ready" from history, and the customer was told
+    // their food was ready for an order that no longer existed.
+    if (isTerminalStatus(order.status)) {
+      return res.status(409).json({
+        error: `This order is ${String(order.status).replace(/_/g, ' ')} — the customer can no longer be notified about it.`,
+        code: 'ORDER_NOT_ACTIVE',
+      });
     }
 
     const fcm = require('../lib/fcm');
