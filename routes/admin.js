@@ -3,6 +3,15 @@ const router = express.Router();
 const { prisma } = require('../lib/prisma');
 const { emitAccountStatusUpdate, emitProductStatusUpdate } = require('../lib/socket');
 
+// Temporary-disable marker written into profiles.profile_status, which is VarChar(30).
+// A full ISO string makes "DISABLED:2026-07-22T16:30:23.236Z" — 33 chars — so every
+// temporary disable failed with "value too long". Dropping the milliseconds gives 29
+// and still parses with new Date() on both the server and the apps.
+const disabledUntilStatus = (hours) =>
+  `DISABLED:${new Date(Date.now() + Number(hours) * 60 * 60 * 1000)
+    .toISOString()
+    .replace(/\.\d{3}Z$/, 'Z')}`;
+
 // Admin authentication middleware
 // Validates the X-Admin-Key header against ADMIN_SECRET env var
 const requireAdmin = (req, res, next) => {
@@ -95,6 +104,53 @@ router.put('/vendors/:id/approve', requireAdmin, async (req, res) => {
     res.json({ success: true, message: 'Vendor approved successfully', vendor: updatedVendor });
   } catch (error) {
     res.status(500).json({ error: 'Approval failed', details: error.message });
+  }
+});
+
+/**
+ * POST /api/admin/vendors/:id/notify-status
+ * Notify-only: emit the socket event + push for a status the CALLER already wrote.
+ *
+ * The Admin panel talks to the database directly, so it can't reach this server's
+ * socket.io instance or firebase-admin. Without this, a vendor approved from the
+ * Admin only found out by polling — nothing arrived while the app was closed.
+ * Deliberately does no DB writes: the caller owns the write, this owns delivery.
+ */
+router.post('/vendors/:id/notify-status', requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status, reason } = req.body;
+    if (!status) return res.status(400).json({ error: 'status is required' });
+
+    const upper = String(status).toUpperCase();
+
+    const vendor = await prisma.vendor.findUnique({ where: { id }, select: { id: true } });
+    if (!vendor) return res.status(404).json({ error: 'Vendor not found' });
+
+    try { emitAccountStatusUpdate(id, upper); } catch (_) {}
+
+    const messages = {
+      ACTIVE: ['KYC Approved', 'Your business profile has been verified. You can go online and start taking orders.', 'KYC_APPROVED'],
+      APPROVED: ['KYC Approved', 'Your business profile has been verified. You can go online and start taking orders.', 'KYC_APPROVED'],
+      REJECTED: ['KYC Rejected', `Your verification was rejected. ${reason || 'Please review your documents and resubmit.'}`, 'KYC_REJECTED'],
+      SUSPENDED: ['Account Suspended', `Your account has been suspended. ${reason || 'Contact support for details.'}`, 'KYC_STATUS_UPDATED'],
+      DISABLED: ['Account Disabled', `Your account has been disabled. ${reason || 'Contact support for details.'}`, 'KYC_STATUS_UPDATED'],
+    };
+    const entry = messages[upper];
+
+    if (entry) {
+      const [title, body, type] = entry;
+      try {
+        const fcm = require('../lib/fcm');
+        await fcm.sendToVendor(id, { title, body, type, channelId: 'kyc' });
+      } catch (err) {
+        console.warn('[ADMIN] notify-status push failed (non-fatal):', err.message);
+      }
+    }
+
+    res.json({ success: true, notified: !!entry, status: upper });
+  } catch (error) {
+    res.status(500).json({ error: 'Notify failed', details: error.message });
   }
 });
 
@@ -349,8 +405,8 @@ router.post('/customer/:id/disable', requireAdmin, async (req, res) => {
       return res.status(404).json({ error: 'Customer profile not found' });
     }
 
-    const disabledUntil = new Date(Date.now() + Number(hours) * 60 * 60 * 1000).toISOString();
-    const statusString = `DISABLED:${disabledUntil}`;
+    const statusString = disabledUntilStatus(hours);
+    const disabledUntil = statusString.split('DISABLED:')[1];
 
     const updatedProfile = await prisma.profile.update({
       where: { id: customer.profileId },
@@ -480,8 +536,8 @@ router.post('/vendor/:id/disable', requireAdmin, async (req, res) => {
       return res.status(404).json({ error: 'Vendor profile not found' });
     }
 
-    const disabledUntil = new Date(Date.now() + Number(hours) * 60 * 60 * 1000).toISOString();
-    const statusString = `DISABLED:${disabledUntil}`;
+    const statusString = disabledUntilStatus(hours);
+    const disabledUntil = statusString.split('DISABLED:')[1];
 
     const updatedProfile = await prisma.profile.update({
       where: { id: vendor.profileId },
