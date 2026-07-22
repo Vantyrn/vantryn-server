@@ -195,13 +195,17 @@ model Rider {
 model Category {
   id           String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   vendorId     String?   @map("vendor_id") @db.Uuid
-  name         String    @unique @db.VarChar(100)
+  name         String    @db.VarChar(100)
   description  String?
   displayOrder Int       @default(0) @map("display_order")
   createdAt    DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
   vendor       Vendor?   @relation(fields: [vendorId], references: [id], onDelete: Cascade)
   products     Product[] @relation("ProductToCategory")
 
+  // Per-vendor, NOT global. A global unique on name alone meant the first vendor to
+  // use "Desserts" locked that name for every other store — their scoped lookup missed
+  // the row and the create died with P2002 (index migrated 2026-07-23).
+  @@unique([vendorId, name])
   @@map("categories")
   @@schema("vendor_delivery")
 }

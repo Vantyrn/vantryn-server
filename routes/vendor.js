@@ -17,6 +17,35 @@ const { emitOrderStatusUpdate, emitVendorStatusUpdate } = require('../lib/socket
 const { getPresignedUploadUrl } = require('../lib/storage');
 const { checkAndTransitionVendorOffline } = require('../lib/vendorStatusHelper');
 
+// Menu categories are PER-VENDOR (Category.vendorId, and the listing filters
+// vendorId = mine OR null), but the database still carries a GLOBAL unique index on
+// name alone (categories_name_key). So the first vendor to use "Desserts" locked that
+// name for everyone: another vendor's lookup is scoped to own+global and misses the
+// row, the create then collides, and product creation died on a raw P2002.
+//
+// The real fix is making the index (vendor_id, name); until that lands this degrades to
+// a clear 409 instead of a 500, and afterwards the P2002 branch only catches a genuine
+// same-vendor race and self-heals. Reusing the other vendor's row is NOT an option —
+// it is invisible to this vendor, so their product would land in a category they can
+// neither see nor edit.
+const resolveCategoryByName = async (name, vendorId) => {
+  const scoped = { name, OR: [{ vendorId }, { vendorId: null }] };
+  const existing = await prisma.category.findFirst({ where: scoped });
+  if (existing) return existing;
+  try {
+    return await prisma.category.create({ data: { name, vendorId } });
+  } catch (e) {
+    if (e.code !== 'P2002') throw e;
+    const raced = await prisma.category.findFirst({ where: scoped });
+    if (raced) return raced;
+    throw Object.assign(
+      new Error(`The category name "${name}" is already in use by another store. Please pick a different name.`),
+      { status: 409, code: 'CATEGORY_NAME_TAKEN' }
+    );
+  }
+};
+
+
 // DIAGNOSTIC: Check if this file is actually loaded
 router.get('/health-check', (req, res) => {
   res.json({ 
@@ -94,9 +123,10 @@ router.post('/categories', firebaseAuth, async (req, res) => {
   try {
     const profile = await prisma.profile.findUnique({ where: { firebaseUid: req.user.uid }, include: { vendor: true } });
     const { name, description } = req.body;
-    const category = await prisma.category.create({
-      data: { vendorId: profile.vendor.id, name, description }
-    });
+    const category = await resolveCategoryByName(name, profile.vendor.id);
+    if (description && !category.description) {
+      await prisma.category.update({ where: { id: category.id }, data: { description } }).catch(() => {});
+    }
     res.json({ success: true, category });
   } catch (error) {
     res.status(500).json({ error: 'Failed to create category' });
@@ -1551,17 +1581,7 @@ router.post('/products', firebaseAuth, requireKyc, async (req, res) => {
         resolvedCategoryIds.push(catInput);
       } else {
         // Try to find by name
-        let cat = await prisma.category.findFirst({
-          where: { 
-            name: catInput,
-            OR: [{ vendorId: profile.vendor.id }, { vendorId: null }]
-          }
-        });
-        if (!cat) {
-          cat = await prisma.category.create({
-            data: { name: catInput, vendorId: profile.vendor.id }
-          });
-        }
+        const cat = await resolveCategoryByName(catInput, profile.vendor.id);
         resolvedCategoryIds.push(cat.id);
       }
     }
@@ -1714,6 +1734,7 @@ router.post('/products', firebaseAuth, requireKyc, async (req, res) => {
     });
   } catch (error) {
     console.error('[VENDOR] Add Product error:', error);
+    if (error.status) return res.status(error.status).json({ error: error.message, code: error.code });
     res.status(500).json({ error: 'Failed to add product', details: error.message });
   }
 });
@@ -1748,17 +1769,7 @@ router.put('/products/:id', firebaseAuth, requireKyc, async (req, res) => {
           if (isUuid(catInput)) {
             resolvedCategoryIds.push(catInput);
           } else {
-            let cat = await prisma.category.findFirst({
-              where: { 
-                name: catInput,
-                OR: [{ vendorId: profile.vendor.id }, { vendorId: null }]
-              }
-            });
-            if (!cat) {
-              cat = await prisma.category.create({
-                data: { name: catInput, vendorId: profile.vendor.id }
-              });
-            }
+            const cat = await resolveCategoryByName(catInput, profile.vendor.id);
             resolvedCategoryIds.push(cat.id);
           }
         }
@@ -1954,6 +1965,7 @@ router.put('/products/:id', firebaseAuth, requireKyc, async (req, res) => {
       });
     } catch (error) {
       console.error('[VENDOR] Update Product error:', error);
+      if (error.status) return res.status(error.status).json({ error: error.message, code: error.code });
       res.status(500).json({ error: 'Failed to update product', details: error.message });
     }
 });
