@@ -5,6 +5,7 @@ const logger = require('../lib/logger');
 const OrderService = require('../services/orderService');
 const CartService = require('../services/cartService');
 const deliveryService = require('../src/modules/delivery/delivery.service');
+const env = require('../src/config/env');
 
 const firebaseAuth = require('../middleware/auth');
 const requireCustomer = require('../middleware/customer');
@@ -37,9 +38,19 @@ router.post('/verify', firebaseAuth, requireCustomer, guestSession, validateBody
     // must pass Razorpay HMAC verification; sandbox/test payments are accepted
     // without a real charge ONLY when explicitly enabled (the Razorpay-test pilot)
     // or in dev — never silently in a live production build.
+    // Cash on delivery is not a payment to verify — nothing has been charged yet and the
+    // rider collects on handover (the order is created with paid:false below). The gate
+    // had only two branches, sandbox or Razorpay-signature, so a COD checkout fell into
+    // the signature branch and was rejected with PAYMENT_NOT_VERIFIED. It only appears to
+    // work today because NODE_ENV isn't production, which waves every sandbox intent through.
+    const method = String(req.body.paymentMethod || 'Online').toUpperCase();
+    const isCod = method === 'CASH' || method === 'COD';
+
     const isSandbox = typeof paymentIntentId === 'string' && paymentIntentId.startsWith('pi_sandbox_');
-    if (isSandbox) {
-      const sandboxAllowed = process.env.SANDBOX_PAYMENTS === 'on' || process.env.NODE_ENV !== 'production';
+    if (isCod) {
+      // no charge to authenticate
+    } else if (isSandbox) {
+      const sandboxAllowed = env.SANDBOX_PAYMENTS;
       if (!sandboxAllowed) {
         console.error('[PAYMENT] Sandbox payment rejected: SANDBOX_PAYMENTS off in production.');
         return res.status(403).json({ error: 'PAYMENT_NOT_VERIFIED', message: 'Test payments are disabled.' });
@@ -115,13 +126,12 @@ router.post('/verify', firebaseAuth, requireCustomer, guestSession, validateBody
     try {
       const { assertServiceable } = require('../lib/deliveryCost');
       const vendorForSvc = await prisma.vendor.findUnique({ where: { id: cart.vendorId } });
-      const method = (req.body.paymentMethod || 'Online').toUpperCase();
       // Server-authoritative fee. NEVER use req.body.deliveryFee — a client can manipulate it.
       ({ deliveryCost: serverDeliveryFee } = await assertServiceable({
         vendor: vendorForSvc,
         address,
         cartTotal: cart.total,
-        paid: method !== 'CASH' && method !== 'COD'
+        paid: !isCod
       }));
     } catch (svcErr) {
       if (svcErr.code === 'DELIVERY_UNAVAILABLE') {

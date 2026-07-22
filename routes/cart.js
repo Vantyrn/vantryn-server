@@ -108,14 +108,23 @@ router.delete('/', firebaseAuthOptional, guestSession, async (req, res) => {
         identifier.customerId = profile.customer.id;
     }
 
+    // Every other cart mutation goes through CartService, which asserts the cart is
+    // editable — it refuses while a UPI payment is CLAIMED, and voids un-claimed ones.
+    // This route deleted the rows directly, so "Clear & Add" after claiming a UPI
+    // payment wiped the cart out from under the confirmation flow; the payment then
+    // landed with no cart and was marked DISPUTED (money taken, no order).
+    await CartService._assertEditable(identifier);
+
     const { vendorId } = req.query;
     const baseWhere = identifier.customerId ? { customerId: identifier.customerId } : { guestId: identifier.guestId };
-    
+
     await prisma.cart.deleteMany({
       where: vendorId ? { ...baseWhere, vendorId } : baseWhere
     });
     res.json({ success: true });
   } catch (error) {
+    console.error('[CART-ROUTE] Clear error:', error);
+    if (error.status) return res.status(error.status).json({ code: error.code, message: error.message });
     res.status(500).json({ error: 'Failed to clear cart' });
   }
 });
