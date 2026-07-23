@@ -706,24 +706,27 @@ router.get('/profile', firebaseAuth, async (req, res) => {
       }
     }
 
-    // Make accountStatus authoritative for profileStatus. Previously a PENDING accountStatus
-    // fell through and left a stale 'ACTIVE' profileStatus in place — so an unregistered
-    // vendor (accountStatus PENDING) whose profile said ACTIVE walked straight onto the
-    // operational dashboard. profileStatusForAccount downgrades it to PENDING (and preserves
-    // admin SUSPENDED/DISABLED blocks).
-    if (finalProfile.role === 'VENDOR' && finalProfile.vendor) {
-      const { profileStatusForAccount } = require('../lib/vendorStatus');
-      const targetStatus = profileStatusForAccount(finalProfile.vendor.accountStatus, finalProfile.profileStatus);
+    // The vendor's authoritative status comes from accountStatus. This is what the vendor
+    // app must see — NOT the raw shared profileStatus, which reflects the CUSTOMER identity
+    // for a number that is both a vendor and a customer (allowed). vendorMappedStatus is
+    // reported as this endpoint's profileStatus below.
+    const { profileStatusForAccount } = require('../lib/vendorStatus');
+    let vendorMappedStatus = finalProfile.vendor
+      ? profileStatusForAccount(finalProfile.vendor.accountStatus, finalProfile.profileStatus)
+      : finalProfile.profileStatus;
 
-      if (targetStatus !== finalProfile.profileStatus) {
-        console.log(`[VENDOR-PROFILE] Syncing status from ${finalProfile.profileStatus} to ${targetStatus}`);
-        const updatedProfile = await prisma.profile.update({
-          where: { id: finalProfile.id },
-          data: { profileStatus: targetStatus },
-          include: { vendor: { include: { bankDetails: true, complianceFlags: true } } }
-        });
-        finalProfile = updatedProfile;
-      }
+    // Persist to the shared Profile.profileStatus ONLY for a vendor-only profile — writing
+    // it for a dual-role user would clobber their customer status. (An unregistered
+    // vendor whose stale profileStatus said ACTIVE previously walked onto the dashboard;
+    // reporting vendorMappedStatus below fixes that regardless of what's persisted.)
+    if (finalProfile.role === 'VENDOR' && finalProfile.vendor && vendorMappedStatus !== finalProfile.profileStatus) {
+      console.log(`[VENDOR-PROFILE] Syncing status from ${finalProfile.profileStatus} to ${vendorMappedStatus}`);
+      const updatedProfile = await prisma.profile.update({
+        where: { id: finalProfile.id },
+        data: { profileStatus: vendorMappedStatus },
+        include: { vendor: { include: { bankDetails: true, complianceFlags: true } } }
+      });
+      finalProfile = updatedProfile;
     }
 
     // Self-Healing block expiration for temporarily disabled accounts
@@ -764,7 +767,9 @@ router.get('/profile', firebaseAuth, async (req, res) => {
       profilePic: addCacheBuster(v.profilePicUrl) || 'https://via.placeholder.com/150',
       operatingHours: v.operatingHours || 'Not configured',
       kycStatus: v.accountStatus,
-      profileStatus: finalProfile.profileStatus,
+      // The VENDOR's status (from accountStatus), not the shared field — so a dual
+      // vendor+customer number is judged by its vendor approval, not its customer status.
+      profileStatus: vendorMappedStatus,
       phoneVerified: v.phoneVerified,
       // Authoritative online/offline so the app reflects a server-side auto-offline
       // (e.g. the store was force-closed while online) on the next launch.
