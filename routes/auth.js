@@ -94,14 +94,12 @@ router.post('/sync', firebaseAuth, async (req, res) => {
 
     // SELF-HEALING: Determine correct profileStatus based on vendor/rider records
     let currentStatus = profile.profileStatus;
-    
+
     if (profile.role === 'VENDOR' && profile.vendor) {
-      const vStatus = profile.vendor.accountStatus;
-      if (['ACTIVE', 'APPROVED'].includes(vStatus)) {
-        currentStatus = 'ACTIVE';
-      } else if (['UNDER_REVIEW', 'KYC_SUBMITTED'].includes(vStatus)) {
-        currentStatus = 'UNDER_REVIEW';
-      }
+      // accountStatus is authoritative — a PENDING vendor must not keep a stale 'ACTIVE'
+      // profileStatus (which would let an unregistered vendor onto the dashboard on relogin).
+      const { profileStatusForAccount } = require('../lib/vendorStatus');
+      currentStatus = profileStatusForAccount(profile.vendor.accountStatus, profile.profileStatus);
     } else if (profile.role === 'RIDER' && profile.rider) {
       const rStatus = profile.rider.accountStatus?.toUpperCase();
       if (['ACTIVE', 'APPROVED'].includes(rStatus)) {
