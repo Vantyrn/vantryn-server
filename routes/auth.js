@@ -119,6 +119,14 @@ router.post('/sync', firebaseAuth, async (req, res) => {
 
     console.log(`[AUTH-SYNC] Success! Profile ID: ${profile.id}, Role: ${profile.role}, Status: ${currentStatus}`);
 
+    // vendorStatus: the vendor identity's own approval status, derived from the vendor
+    // record's accountStatus. The vendor app uses THIS (not the shared profileStatus,
+    // which reflects the customer identity for a number that is both vendor and customer).
+    const { profileStatusForAccount } = require('../lib/vendorStatus');
+    const vendorStatus = profile.vendor
+      ? profileStatusForAccount(profile.vendor.accountStatus, profile.profileStatus)
+      : null;
+
     res.json({
       success: true,
       user: {
@@ -126,6 +134,7 @@ router.post('/sync', firebaseAuth, async (req, res) => {
         phoneNumber: profile.phoneNumber,
         role: profile.role,
         profileStatus: currentStatus,
+        vendorStatus,
         phoneVerified: profile.vendor ? profile.vendor.phoneVerified : false
       }
     });
@@ -184,7 +193,20 @@ router.post('/role', firebaseAuth, async (req, res) => {
         }
       }));
     }
-    
+
+    // Sync profileStatus to the vendor's accountStatus. This matters when a phone that
+    // was previously a CUSTOMER (profileStatus 'ACTIVE') is (re)assigned VENDOR: without
+    // this the profile kept 'ACTIVE' and the new, unapproved vendor was treated as
+    // approved — landing on the operational dashboard instead of registration.
+    if (role === 'VENDOR' && vendorRecord) {
+      const { profileStatusForAccount } = require('../lib/vendorStatus');
+      const target = profileStatusForAccount(vendorRecord.accountStatus, profile.profileStatus);
+      if (target !== profile.profileStatus) {
+        await withRetry(() => prisma.profile.update({ where: { id: profile.id }, data: { profileStatus: target } }));
+        profile.profileStatus = target;
+      }
+    }
+
     res.json({
       success: true,
       user: {
