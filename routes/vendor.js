@@ -742,7 +742,14 @@ router.get('/profile', firebaseAuth, async (req, res) => {
     }
 
     const v = finalProfile.vendor;
-    
+
+    // Heartbeat: this endpoint is polled every ~15s while the vendor app's JS is alive,
+    // so every fetch is proof of life. Stamp it (fire-and-forget) so the reachability
+    // check can tell a genuinely-present vendor from one whose app was killed while
+    // 'online'. Only meaningful while online, but harmless to always stamp.
+    prisma.vendor.update({ where: { id: v.id }, data: { bubbleLastSeenAt: new Date() } })
+      .catch((e) => console.warn('[VENDOR] heartbeat stamp failed:', e.message));
+
     // Transform to match frontend expectations
     const vendorResponse = {
       id: v.id,
@@ -998,7 +1005,9 @@ router.put('/status/toggle', firebaseAuth, requireKyc, async (req, res) => {
         return res.json({ success: true, status });
       } else {
         const status = 'online';
-        await prisma.vendor.update({ where: { id: vendorId }, data: { onlineStatus: status } });
+        // Stamp the heartbeat on going online so the vendor is immediately reachable
+        // (not treated as stale until their first profile poll ~15s later).
+        await prisma.vendor.update({ where: { id: vendorId }, data: { onlineStatus: status, bubbleLastSeenAt: new Date() } });
         await fcm.updateFloatingBubble(vendorId, true, activeOrdersCount);
         emitVendorStatusUpdate(vendorId, true);
         return res.json({ success: true, status });
@@ -1018,7 +1027,10 @@ router.put('/status/toggle', firebaseAuth, requireKyc, async (req, res) => {
     }
 
     const newStatus = isOnline ? 'online' : 'offline';
-    await prisma.vendor.update({ where: { id: vendorId }, data: { onlineStatus: newStatus } });
+    await prisma.vendor.update({
+      where: { id: vendorId },
+      data: { onlineStatus: newStatus, ...(isOnline ? { bubbleLastSeenAt: new Date() } : {}) },
+    });
     await fcm.updateFloatingBubble(vendorId, isOnline, activeOrdersCount);
     emitVendorStatusUpdate(vendorId, isOnline);
 

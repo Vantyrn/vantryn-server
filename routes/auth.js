@@ -20,7 +20,10 @@ router.post('/sync', firebaseAuth, async (req, res) => {
     // belong to that SAME vendor — and vice-versa. Reject mismatches with a clear 409
     // BEFORE any adoption/upsert mutates state. The @unique constraints on
     // profiles.phone_number and vendors.email still backstop races.
-    const cleanEmail = email ? email.trim().toLowerCase() : null;
+    // Treat missing OR blank/whitespace email as "no email" so a phone-only vendor is never
+    // caught by the collision check. Only a real, non-empty email is matched against
+    // vendors.email — empty ones are never "already registered".
+    const cleanEmail = email && email.trim() ? email.trim().toLowerCase() : null;
     const emailVendor = cleanEmail
       ? await withRetry(() => prisma.vendor.findFirst({ where: { email: cleanEmail } }))
       : null;
