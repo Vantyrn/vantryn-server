@@ -706,16 +706,15 @@ router.get('/profile', firebaseAuth, async (req, res) => {
       }
     }
 
-    // Sync profileStatus based on vendor accountStatus to prevent client routing loops
+    // Make accountStatus authoritative for profileStatus. Previously a PENDING accountStatus
+    // fell through and left a stale 'ACTIVE' profileStatus in place — so an unregistered
+    // vendor (accountStatus PENDING) whose profile said ACTIVE walked straight onto the
+    // operational dashboard. profileStatusForAccount downgrades it to PENDING (and preserves
+    // admin SUSPENDED/DISABLED blocks).
     if (finalProfile.role === 'VENDOR' && finalProfile.vendor) {
-      const vStatus = finalProfile.vendor.accountStatus;
-      let targetStatus = finalProfile.profileStatus;
-      if (['ACTIVE', 'APPROVED'].includes(vStatus)) {
-        targetStatus = 'ACTIVE';
-      } else if (['UNDER_REVIEW', 'KYC_SUBMITTED'].includes(vStatus)) {
-        targetStatus = 'UNDER_REVIEW';
-      }
-      
+      const { profileStatusForAccount } = require('../lib/vendorStatus');
+      const targetStatus = profileStatusForAccount(finalProfile.vendor.accountStatus, finalProfile.profileStatus);
+
       if (targetStatus !== finalProfile.profileStatus) {
         console.log(`[VENDOR-PROFILE] Syncing status from ${finalProfile.profileStatus} to ${targetStatus}`);
         const updatedProfile = await prisma.profile.update({
