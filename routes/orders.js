@@ -9,6 +9,8 @@ const env = require('../src/config/env');
 const { assertServiceable } = require('../lib/deliveryCost');
 const { getSfxTracking } = require('../lib/sfxTracking');
 const { isCancellableStatus } = require('../lib/orderStatus');
+const { isVendorReachable } = require('../lib/vendorReachable');
+const { emitVendorStatusUpdate } = require('../lib/socket');
 
 /**
  * MODULE 5 — ORDER & PAYMENT
@@ -36,10 +38,23 @@ router.post('/checkout', firebaseAuth, requireCustomer, async (req, res) => {
 
     // VENDOR GATEKEEPER CHECK (Pre-Payment)
     const vendor = await prisma.vendor.findUnique({ where: { id: cart.vendorId } });
+    // Reachability, not just the stored flag: a vendor who killed the app stays 'online'
+    // in the DB forever. If they say online but haven't checked in recently, they cannot
+    // see or accept this order — flip them offline so they drop out of browsing for the
+    // next customer too, and reject the order cleanly instead of letting it sit.
+    if (vendor && vendor.onlineStatus === 'online' && !isVendorReachable(vendor)) {
+      await prisma.vendor.update({ where: { id: vendor.id }, data: { onlineStatus: 'offline' } }).catch(() => {});
+      try { emitVendorStatusUpdate(vendor.id, false); } catch (_) {}
+      console.log(`[ORDERS] Vendor ${vendor.id} was 'online' but stale (app closed) — flipped offline, order rejected.`);
+      return res.status(403).json({
+        error: 'VENDOR_OFFLINE',
+        message: 'This vendor just went offline and is not accepting orders right now.'
+      });
+    }
     if (!vendor || vendor.onlineStatus !== 'online') {
-      return res.status(403).json({ 
-        error: 'VENDOR_OFFLINE', 
-        message: 'This vendor is currently offline and not accepting orders.' 
+      return res.status(403).json({
+        error: 'VENDOR_OFFLINE',
+        message: 'This vendor is currently offline and not accepting orders.'
       });
     }
 

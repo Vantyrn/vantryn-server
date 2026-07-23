@@ -2,6 +2,12 @@ const express = require('express');
 const router = express.Router();
 const { prisma } = require('../lib/prisma');
 const guestSession = require('../middleware/guest');
+const { isVendorReachable } = require('../lib/vendorReachable');
+
+// Expose reachability, not the raw stored flag: a vendor who killed the app stays
+// 'online' in the DB but can't take orders. Show them as offline so customers don't
+// try to order from a store that will just let it time out.
+const reachableStatus = (v) => (isVendorReachable(v) ? 'online' : 'offline');
 
 /**
  * MODULE 2 — VENDOR & PRODUCT BROWSING
@@ -66,11 +72,13 @@ router.get('/vendors', guestSession, async (req, res) => {
         longitude: true,
         storeDescription: true,
         onlineStatus: true,
+        bubbleLastSeenAt: true,
         ratingsSummary: true
       }
     });
     const mappedVendors = vendors.map(v => ({
       ...v,
+      onlineStatus: reachableStatus(v),
       name: v.businessName,      // Alias for frontend compatibility 
       description: v.storeDescription, // Alias for frontend compatibility
       rating: v.ratingsSummary?.avgRating ? Number(v.ratingsSummary.avgRating).toFixed(1) : null,
@@ -105,6 +113,7 @@ router.get('/vendors/:id', guestSession, async (req, res) => {
     
     const mappedVendor = {
       ...vendor,
+      onlineStatus: reachableStatus(vendor),
       rating: vendor.ratingsSummary?.avgRating ? Number(vendor.ratingsSummary.avgRating).toFixed(1) : null
     };
 
@@ -275,12 +284,14 @@ router.get('/search', guestSession, async (req, res) => {
         latitude: true,
         longitude: true,
         onlineStatus: true,
+        bubbleLastSeenAt: true,
         ratingsSummary: true
       }
     });
 
     const mappedVendors = vendors.map(v => ({
       ...v,
+      onlineStatus: reachableStatus(v),
       name: v.businessName,
       rating: v.ratingsSummary?.avgRating ? Number(v.ratingsSummary.avgRating).toFixed(1) : null
     }));
@@ -306,6 +317,7 @@ router.get('/search', guestSession, async (req, res) => {
             id: true,
             businessName: true,
             onlineStatus: true,
+            bubbleLastSeenAt: true,
             latitude: true,
             longitude: true,
             ratingsSummary: true
@@ -322,7 +334,7 @@ router.get('/search', guestSession, async (req, res) => {
       price: Number(p.basePrice),
       vendorId: p.vendorId || p.vendor?.id,
       vendorName: p.vendor?.businessName || 'Partner Restaurant',
-      vendorOnline: p.vendor?.onlineStatus === 'online',
+      vendorOnline: isVendorReachable(p.vendor),
       vendorLatitude: p.vendor?.latitude,
       vendorLongitude: p.vendor?.longitude,
       vendorRating: p.vendor?.ratingsSummary?.avgRating ? Number(p.vendor.ratingsSummary.avgRating).toFixed(1) : null,

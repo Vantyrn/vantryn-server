@@ -28,6 +28,15 @@ class OrderService {
       if (!vendor || vendor.onlineStatus !== 'online') {
         throw new Error('VENDOR_OFFLINE: Vendor is currently not accepting orders.');
       }
+      // Reachability guard (see lib/vendorReachable.js): a stale 'online' vendor killed
+      // their app and can't take this order. Flip them offline and refuse. NOT applied to
+      // the skip path — a confirmed UPI payment is honored even if the vendor just dropped.
+      const { isVendorReachable } = require('../lib/vendorReachable');
+      if (!isVendorReachable(vendor)) {
+        await prisma.vendor.update({ where: { id: vendor.id }, data: { onlineStatus: 'offline' } }).catch(() => {});
+        try { require('../lib/socket').emitVendorStatusUpdate(vendor.id, false); } catch (_) {}
+        throw new Error('VENDOR_OFFLINE: Vendor just went offline and is not accepting orders.');
+      }
 
       const { checkVendorAvailability } = require('../lib/availability');
       const { isOpen, nextOpen } = checkVendorAvailability(vendor.operatingHours);
