@@ -91,8 +91,8 @@ router.put('/vendors/:id/approve', requireAdmin, async (req, res) => {
 
     // Send push notification
     try {
-      const fcm = require('../lib/fcm');
-      await fcm.sendToVendor(updatedVendor.id, {
+      const { notifyVendor } = require('../lib/notify');
+      await notifyVendor(updatedVendor.id, {
         title: 'KYC Approved',
         body: 'Your business profile has been verified. Welcome to Vantyrn!',
         type: 'KYC_APPROVED'
@@ -141,8 +141,8 @@ router.post('/vendors/:id/notify-status', requireAdmin, async (req, res) => {
     if (entry) {
       const [title, body, type] = entry;
       try {
-        const fcm = require('../lib/fcm');
-        await fcm.sendToVendor(id, { title, body, type, channelId: 'kyc' });
+        const { notifyVendor } = require('../lib/notify');
+        await notifyVendor(id, { title, body, type, channelId: 'kyc' });
       } catch (err) {
         console.warn('[ADMIN] notify-status push failed (non-fatal):', err.message);
       }
@@ -187,8 +187,8 @@ router.put('/vendors/:id/reject', requireAdmin, async (req, res) => {
 
     // Send push notification for rejection
     try {
-      const fcm = require('../lib/fcm');
-      await fcm.sendToVendor(vendor.id, {
+      const { notifyVendor } = require('../lib/notify');
+      await notifyVendor(vendor.id, {
         title: 'KYC Rejected',
         body: `Your business profile verification was rejected. Reason: ${reason || 'Invalid documents.'}`,
         type: 'KYC_REJECTED'
@@ -495,8 +495,8 @@ router.post('/vendor/:id/suspend', requireAdmin, async (req, res) => {
 
     // Send FCM push notification to inform vendor
     try {
-      const fcm = require('../lib/fcm');
-      await fcm.sendToVendor(vendor.id, {
+      const { notifyVendor } = require('../lib/notify');
+      await notifyVendor(vendor.id, {
         title: 'Account Suspended',
         body: reason
           ? `Your vendor account has been suspended. Reason: ${reason}`
@@ -549,8 +549,8 @@ router.post('/vendor/:id/disable', requireAdmin, async (req, res) => {
 
     // Send FCM push notification
     try {
-      const fcm = require('../lib/fcm');
-      await fcm.sendToVendor(vendor.id, {
+      const { notifyVendor } = require('../lib/notify');
+      await notifyVendor(vendor.id, {
         title: 'Account Temporarily Disabled',
         body: reason
           ? `Your account has been temporarily disabled for ${hours} hours. Reason: ${reason}`
@@ -606,8 +606,8 @@ router.post('/vendor/:id/enable', requireAdmin, async (req, res) => {
 
     // Send FCM push notification to inform vendor
     try {
-      const fcm = require('../lib/fcm');
-      await fcm.sendToVendor(vendor.id, {
+      const { notifyVendor } = require('../lib/notify');
+      await notifyVendor(vendor.id, {
         title: 'Account Restored',
         body: 'Your vendor account has been reactivated. You can now log in and manage your store.',
         type: 'KYC_APPROVED',

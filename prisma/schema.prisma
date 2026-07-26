@@ -167,10 +167,16 @@ model NotificationLog {
   role   String   @db.VarChar(20)
   title  String   @db.VarChar(255)
   body   String
+  // 'sent' | 'read' — doubles as the inbox read flag, so no extra column.
   status String   @default("sent") @db.VarChar(30)
+  // Event name (ORDER_STATUS, KYC_APPROVED, ...) used to pick the icon and the
+  // deep link; `data` carries the route params (orderId, productId, ...).
+  type   String?  @db.VarChar(50)
+  data   Json?
   sentAt DateTime @default(now()) @map("sent_at") @db.Timestamptz(6)
 
   @@index([userId])
+  @@index([userId, sentAt(sort: Desc)])
   @@map("notification_logs")
   @@schema("vendor_delivery")
 }

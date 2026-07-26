@@ -273,12 +273,12 @@ router.post('/:id/cancel', firebaseAuth, requireCustomer, async (req, res) => {
     getIo().to(`vendor_${order.vendorId}`).emit('order_cancelled', { orderId: id, reason: 'Cancelled by customer' });
 
     try {
-        const fcm = require('../lib/fcm');
-        await fcm.sendToVendor(order.vendorId, {
+        const { notifyVendor } = require('../lib/notify');
+        await notifyVendor(order.vendorId, {
             title: 'Order Cancelled',
             body: `Order #${id.substring(0, 8)} was cancelled by the customer.`,
             type: 'ORDER_CANCELLED',
-            orderId: id
+            data: { orderId: id },
         });
     } catch (pushErr) {
         console.error('[ORDER CANCEL] Failed to send push notification to vendor:', pushErr.message);
