@@ -49,18 +49,40 @@ const requireKyc = async (req, res, next) => {
       }
     }
 
-    // Role specific KYC mapping
+    // Decide what this account IS from the relation that exists, NOT from
+    // profiles.role.
+    //
+    // One profile can own a vendor AND a customer record — the same phone signing
+    // into both apps — and the customer identity-adoption path in lib/prisma.js
+    // rewrites role to 'CUSTOMER' when it does. So an admin-approved vendor who had
+    // also opened the customer app fell through both branches below: isApproved
+    // stayed false and fallbackStatus stayed the literal 'PENDING', and every
+    // requireKyc route answered "KYC not approved / PENDING" no matter how many
+    // times the admin approved them. Their vendor row said ACTIVE the whole time,
+    // which is why the app let them onto the Add Product screen in the first place.
+    // Verified in the live DB: 3 of 7 vendors were in exactly this state.
+    //
+    // The relation is the fact; role is a drift-prone label on a profile that can
+    // legitimately be both things at once.
     let isApproved = false;
     let fallbackStatus = 'PENDING';
 
     const APPROVED_STATUSES = ['approved', 'active', 'ready'];
 
-    if (profile.role === 'VENDOR' && profile.vendor) {
+    if (profile.vendor) {
       fallbackStatus = profile.vendor.accountStatus;
       isApproved = APPROVED_STATUSES.includes(profile.vendor.accountStatus?.toLowerCase());
-    } else if (profile.role === 'RIDER' && profile.rider) {
+    } else if (profile.rider) {
       fallbackStatus = profile.rider.accountStatus;
       isApproved = APPROVED_STATUSES.includes(profile.rider.accountStatus?.toLowerCase());
+    } else {
+      // No vendor/rider record at all — a customer-only account hitting a vendor
+      // route. Say so, instead of reporting a fake 'PENDING' KYC status.
+      console.warn(`[KYC] Access Denied for UID ${uid}: no vendor/rider record on profile ${profile.id}`);
+      return res.status(403).json({
+        error: 'Not a vendor account',
+        code: 'not_a_vendor',
+      });
     }
 
     // Demo & Development Bypass: Auto-approve KYC for mock numbers or when running in local development

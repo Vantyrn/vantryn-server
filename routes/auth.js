@@ -261,7 +261,10 @@ router.post('/verify-phone-payout', firebaseAuth, async (req, res) => {
       return res.status(404).json({ error: 'Profile not found' });
     }
 
-    if (profile.role !== 'VENDOR' || !profile.vendor) {
+    // Keyed off the vendor RELATION, not profiles.role — a vendor who also uses the
+    // customer app has role 'CUSTOMER' (see lib/prisma.js identity adoption) and was
+    // locked out of completing their own payout step.
+    if (!profile.vendor) {
       return res.status(400).json({ error: 'Only vendor accounts can complete phone verification.' });
     }
 

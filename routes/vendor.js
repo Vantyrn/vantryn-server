@@ -1237,12 +1237,12 @@ router.post('/orders/:id/notify-customer', firebaseAuth, requireKyc, async (req,
       });
     }
 
-    const fcm = require('../lib/fcm');
-    await fcm.sendToCustomer(order.customer.profile.firebaseUid, {
+    const { notifyCustomer } = require('../lib/notify');
+    await notifyCustomer(order.customer.profile.firebaseUid, {
       title: title || 'Message from Restaurant',
       body: message,
       type: 'manual_update',
-      orderId: id
+      data: { orderId: id },
     });
 
     res.json({ success: true });
@@ -1380,12 +1380,20 @@ router.get('/orders', firebaseAuth, requireKyc, async (req, res) => {
       
       await prisma.order.updateMany({
         where: { id: { in: expiredIds } },
-        data: { 
+        data: {
           status: 'CANCELLED',
           isFlaggedAdmin: true,
           flagReason: 'SLA Timeout (Cleanup on Fetch)'
         }
       });
+
+      // This bulk update bypassed emitOrderStatusUpdate entirely, so a customer whose
+      // order was auto-cancelled for vendor non-response was NEVER told — the order
+      // just went quiet. Announce each one through the normal channel so both parties
+      // get the socket event, the push and an inbox entry.
+      for (const o of expiredIds) {
+        emitOrderStatusUpdate(o, 'cancelled', 'SYSTEM', profile.vendor.id);
+      }
 
       // Log breaches for these (if not already logged)
       for (const o of expiredOrders) {
@@ -2088,13 +2096,13 @@ router.put('/admin-simulate/approve-vendor/:id', devOnly, firebaseAuth, async (r
 
     // Trigger push notification to vendor for KYC status updates (Approved/Rejected)
     try {
-      const fcm = require('../lib/fcm');
+      const { notifyVendor } = require('../lib/notify');
       const currentStatus = (status || 'APPROVED').toUpperCase();
       const isApproved = currentStatus === 'APPROVED' || currentStatus === 'ACTIVE';
       const isRejected = currentStatus === 'REJECTED' || currentStatus === 'DISABLED';
       
       if (isApproved || isRejected) {
-        await fcm.sendToVendor(vendor.id, {
+        await notifyVendor(vendor.id, {
           title: isApproved ? 'KYC Approved' : 'KYC Rejected',
           body: isApproved 
             ? 'Your store registration has been approved. You are now ready to receive orders!' 

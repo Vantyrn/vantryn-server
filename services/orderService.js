@@ -2,7 +2,8 @@ const { prisma } = require('../lib/prisma');
 const logger = require('../lib/logger');
 const { orderSlaQueue } = require('../lib/bullmq');
 const { emitOrderStatusUpdate, emitIncomingOrder } = require('../lib/socket');
-const fcm = require('../lib/fcm');
+const fcm = require('../lib/fcm'); // still used for updateFloatingBubble (silent data push)
+const { notifyVendor, notifyCustomer } = require('../lib/notify');
 const { checkAndTransitionVendorOffline } = require('../lib/vendorStatusHelper');
 const { ACTIVE_ORDER_STATUSES } = require('../lib/orderStatus');
 
@@ -161,30 +162,16 @@ class OrderService {
       // Emit real-time status update to client sockets:
       emitOrderStatusUpdate(order.id, 'CANCELLED', 'SYSTEM', cart.vendorId);
 
-      // Send emoji-free push notification:
+      // notify() records the inbox entry and sends the push; it never throws.
+      const body = 'Order was automatically cancelled by the system due to security verification.';
       if (cancelledOrder.customer?.profile?.firebaseUid) {
-        try {
-          await fcm.sendToCustomer(cancelledOrder.customer.profile.firebaseUid, {
-            title: 'Order Cancelled',
-            body: 'Order was automatically cancelled by the system due to security verification.',
-            orderId: order.id
-          });
-        } catch (fcmErr) {
-          console.error(`[ORDER-SERVICE] Failed to send customer push: ${fcmErr.message}`);
-        }
-      }
-
-      // Send push notification to vendor:
-      try {
-        await fcm.sendToVendor(cart.vendorId, {
-          title: 'Order Cancelled',
-          body: 'Order was automatically cancelled by the system due to security verification.',
-          orderId: order.id,
-          type: 'SYSTEM_CANCELLATION'
+        await notifyCustomer(cancelledOrder.customer.profile.firebaseUid, {
+          title: 'Order Cancelled', body, type: 'SYSTEM_CANCELLATION', data: { orderId: order.id },
         });
-      } catch (fcmErr) {
-        console.error(`[ORDER-SERVICE] Failed to send vendor push: ${fcmErr.message}`);
       }
+      await notifyVendor(cart.vendorId, {
+        title: 'Order Cancelled', body, type: 'SYSTEM_CANCELLATION', data: { orderId: order.id },
+      });
 
       // Return early, bypassing vendor notifications, floating bubble updates, BullMQ SLA queueing, and Shadowfax delivery.
       return cancelledOrder;
@@ -272,10 +259,11 @@ class OrderService {
     });
     fcm.updateFloatingBubble(cart.vendorId, true, activeOrdersCount);
 
-    await fcm.sendToVendor(cart.vendorId, {
+    await notifyVendor(cart.vendorId, {
       title: 'New Order Received',
-      body: `Order #${order.id.substring(0,8)} is awaiting your acceptance.`,
-      orderId: order.id
+      body: `Order #${order.id.substring(0, 8)} is awaiting your acceptance.`,
+      type: 'NEW_ORDER',
+      data: { orderId: order.id },
     });
 
     // 4. Start BullMQ SLA Timer (5 minutes)
@@ -344,37 +332,12 @@ class OrderService {
       actorRole,
     });
 
-    if (order.customer?.profile?.firebaseUid) {
-      let title = `Order Update: ${newStatus}`;
-      let body = `Your order status has changed to ${newStatus}.`;
-      
-      const cleanStatus = newStatus.toLowerCase();
-      if (cleanStatus === 'accepted') {
-        title = 'Order Accepted!';
-        body = 'Your order has been accepted and is now being prepared.';
-      } else if (cleanStatus === 'preparing') {
-        title = 'Preparing your Order';
-        body = 'The kitchen is busy preparing your delicious food!';
-      } else if (cleanStatus === 'ready_for_pickup') {
-        title = 'Order Ready!';
-        body = 'Your order is ready for pickup or rider assignment.';
-      } else if (cleanStatus === 'out_for_delivery' || cleanStatus === 'picked_up' || cleanStatus === 'dispatched') {
-        title = 'Out for Delivery!';
-        body = 'Great news! Your order is out for delivery with our rider.';
-      } else if (cleanStatus === 'delivered') {
-        title = 'Order Delivered!';
-        body = 'Your order has been successfully delivered. Enjoy your meal!';
-      } else if (cleanStatus === 'cancelled_by_vendor' || cleanStatus === 'cancelled') {
-        title = 'Order Cancelled';
-        body = 'We are sorry, your order was cancelled by the store.';
-      }
-
-      await fcm.sendToCustomer(order.customer.profile.firebaseUid, {
-        title,
-        body,
-        orderId: order.id
-      });
-    }
+    // The customer push for this transition is sent by emitOrderStatusUpdate above
+    // (lib/socket.js CUSTOMER_STATUS_PUSH). A second copy used to be built here, so
+    // every status change sent the customer TWO notifications with different wording
+    // — and any status not in its if/else chain fell through to the raw
+    // "Order Update: ready_for_pickup". One source of copy now, and it also records
+    // the inbox entry.
 
     // Analytics and Offline Check for terminal states (case-insensitive)
     const upperStatus = newStatus.toUpperCase();

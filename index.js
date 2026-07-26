@@ -242,6 +242,7 @@ try {
     app.use('/api/delivery/shadowfax', shadowfaxRoutes);
     app.use('/api/feedback', feedbackRoutes);
     app.use('/api/customer/complaints', complaintRoutes);
+    app.use('/api/notifications', require('./routes/notifications'));
     app.use('/api/admin', require('./routes/admin'));
     app.use('/api/sandbox', require('./routes/sandbox'));
     app.use('/api/telemetry', require('./routes/telemetry'));
