@@ -181,7 +181,11 @@ router.post('/validate-delivery', firebaseAuth, requireCustomer, async (req, res
         deliveryFee: deliveryCost,
         pickupEta,
         dropEta,
-        eta: dropEta != null ? `${dropEta} Mins` : '15 Mins'
+        // null, NOT a placeholder. This used to fall back to the literal '15 Mins'
+        // whenever Shadowfax gave no ETA (simulate mode, or a quote without one),
+        // so the checkout screen showed an invented delivery time as if it were the
+        // real quote. The client shows its own labelled estimate when this is null.
+        eta: dropEta != null ? `${dropEta} mins` : null,
       });
     } catch (sfxErr) {
       res.status(422).json({
@@ -230,6 +234,10 @@ router.get('/:id', firebaseAuth, requireCustomer, async (req, res) => {
         vendor: true, 
         rider: true,
         items: true,
+        // Whether this order has ALREADY been rated. Without it the details screen
+        // kept offering "Rate Your Experience" after the customer had just rated —
+        // and the second attempt 409s, since feedback is one-per-order.
+        feedback: { select: { id: true, rating: true } },
         statusHistory: {
             orderBy: { changedAt: 'asc' }
         },
@@ -240,7 +248,7 @@ router.get('/:id', firebaseAuth, requireCustomer, async (req, res) => {
     });
 
     if (!order) return res.status(404).json({ error: 'Order not found' });
-    res.json({ success: true, order });
+    res.json({ success: true, order: { ...order, hasFeedback: !!order.feedback } });
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch order details' });
   }
