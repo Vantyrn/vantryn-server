@@ -16,7 +16,7 @@ const { orderSlaQueue } = require('../lib/bullmq');
 const { emitOrderStatusUpdate, emitVendorStatusUpdate } = require('../lib/socket');
 const { getPresignedUploadUrl } = require('../lib/storage');
 const { checkAndTransitionVendorOffline } = require('../lib/vendorStatusHelper');
-const { claimPushToken, releasePushToken } = require('../lib/pushToken');
+const { claimVendorPushToken, releaseVendorPushToken } = require('../lib/pushToken');
 
 // Menu categories are PER-VENDOR (Category.vendorId, and the listing filters
 // vendorId = mine OR null), but the database still carries a GLOBAL unique index on
@@ -74,7 +74,7 @@ router.post('/logout', firebaseAuth, async (req, res) => {
       include: { vendor: { select: { id: true, onlineStatus: true } } },
     });
 
-    await releasePushToken(uid);
+    await releaseVendorPushToken(uid);
 
     if (profile?.vendor && profile.vendor.onlineStatus !== 'offline') {
       await prisma.vendor.update({
@@ -109,9 +109,10 @@ router.post('/push-token', firebaseAuth, async (req, res) => {
     // Prisma "Unknown argument pushToken" 500). Fall back to the Expo token only if no
     // native FCM token was provided, so we still store *something* usable.
     const tokenToStore = fcmToken || pushToken;
-    // claimPushToken, not a plain update: the token must belong to exactly one profile,
-    // or a push for the previous account lands on whoever is logged in now.
-    await claimPushToken(uid, tokenToStore);
+    // Stored on the VENDOR row, not the shared profile: one phone running both apps
+    // resolves to a single Profile with one fcm_token, so both apps were overwriting
+    // each other and one device ended up receiving both roles' notifications.
+    await claimVendorPushToken(uid, tokenToStore);
     console.log(`[PUSH-TOKEN] Saved token for UID ${uid}: fcmToken=${!!tokenToStore}`);
     res.json({ success: true });
   } catch (error) {
@@ -926,10 +927,10 @@ router.put('/profile', firebaseAuth, async (req, res) => {
     }
 
 
-    // Update Profile FCM token (no pushToken column exists — writing it is a
-    // Prisma "Unknown argument" crash; Expo tokens are intentionally dropped)
+    // Vendor device token -> vendor row (see lib/pushToken). Writing it to the shared
+    // profile is what made one phone receive both roles' notifications.
     if (fcmToken) {
-      await withRetry(() => claimPushToken(profile.firebaseUid, fcmToken));
+      await withRetry(() => claimVendorPushToken(profile.firebaseUid, fcmToken));
     }
 
     if (bankData && bankData.accountNumber) {
