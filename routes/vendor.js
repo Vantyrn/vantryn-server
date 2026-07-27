@@ -746,12 +746,10 @@ router.get('/profile', firebaseAuth, async (req, res) => {
 
     const v = finalProfile.vendor;
 
-    // Heartbeat: this endpoint is polled every ~15s while the vendor app's JS is alive,
-    // so every fetch is proof of life. Stamp it (fire-and-forget) so the reachability
-    // check can tell a genuinely-present vendor from one whose app was killed while
-    // 'online'. Only meaningful while online, but harmless to always stamp.
-    prisma.vendor.update({ where: { id: v.id }, data: { bubbleLastSeenAt: new Date() } })
-      .catch((e) => console.warn('[VENDOR] heartbeat stamp failed:', e.message));
+    // No heartbeat stamp here any more. This endpoint is polled every ~15s, and nothing
+    // reads bubbleLastSeenAt now that reachability is just onlineStatus (see
+    // lib/vendorReachable.js) — it was a DB write every 15s per online vendor for a
+    // value no one looked at. Still stamped on socket join and on going online.
 
     // Transform to match frontend expectations
     const vendorResponse = {

@@ -3,6 +3,7 @@ const router = express.Router();
 const { prisma } = require('../lib/prisma');
 const guestSession = require('../middleware/guest');
 const { isVendorReachable } = require('../lib/vendorReachable');
+const { checkVendorAvailability } = require('../lib/availability');
 
 // Expose reachability, not the raw stored flag: a vendor who killed the app stays
 // 'online' in the DB but can't take orders. Show them as offline so customers don't
@@ -111,9 +112,16 @@ router.get('/vendors/:id', guestSession, async (req, res) => {
 
     if (!vendor) return res.status(404).json({ error: 'Vendor not found' });
     
+    // Operating-hours state is computed HERE, not in the app: the customer app had its
+    // own copy of this rule that said "reopening today at 9:00 AM" at 11pm, and it read
+    // the device clock while ordering is gated on the server's. One rule, one place.
+    const { isOpen, nextOpen } = checkVendorAvailability(vendor.operatingHours);
+
     const mappedVendor = {
       ...vendor,
       onlineStatus: reachableStatus(vendor),
+      isOpen,
+      nextOpen,
       rating: vendor.ratingsSummary?.avgRating ? Number(vendor.ratingsSummary.avgRating).toFixed(1) : null
     };
 

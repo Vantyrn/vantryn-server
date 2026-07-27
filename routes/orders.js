@@ -10,7 +10,6 @@ const { assertServiceable } = require('../lib/deliveryCost');
 const { getSfxTracking } = require('../lib/sfxTracking');
 const { isCancellableStatus } = require('../lib/orderStatus');
 const { isVendorReachable } = require('../lib/vendorReachable');
-const { emitVendorStatusUpdate } = require('../lib/socket');
 
 /**
  * MODULE 5 — ORDER & PAYMENT
@@ -38,35 +37,13 @@ router.post('/checkout', firebaseAuth, requireCustomer, async (req, res) => {
 
     // VENDOR GATEKEEPER CHECK (Pre-Payment)
     const vendor = await prisma.vendor.findUnique({ where: { id: cart.vendorId } });
-    // Reachability, not just the stored flag: a vendor who killed the app stays 'online'
-    // in the DB forever. If they say online but haven't checked in recently, they cannot
-    // see or accept this order — flip them offline so they drop out of browsing for the
-    // next customer too, and reject the order cleanly instead of letting it sit.
-    if (vendor && vendor.onlineStatus === 'online' && !isVendorReachable(vendor)) {
-      await prisma.vendor.update({ where: { id: vendor.id }, data: { onlineStatus: 'offline' } }).catch(() => {});
-      try { emitVendorStatusUpdate(vendor.id, false); } catch (_) {}
-      console.log(`[ORDERS] Vendor ${vendor.id} was 'online' but stale (app closed) — flipped offline, order rejected.`);
-      return res.status(403).json({
-        error: 'VENDOR_OFFLINE',
-        message: 'This vendor just went offline and is not accepting orders right now.'
-      });
-    }
-    if (!vendor || vendor.onlineStatus !== 'online') {
+    // Being online is a deliberate force-open override of operating hours (a vendor who
+    // opens late still wants the order), so this one flag is the whole check. It also
+    // used to require a fresh heartbeat, which closed live stores — see lib/vendorReachable.js.
+    if (!isVendorReachable(vendor)) {
       return res.status(403).json({
         error: 'VENDOR_OFFLINE',
         message: 'This vendor is currently offline and not accepting orders.'
-      });
-    }
-
-    // Only check operating hours if not explicitly 'online' (though onlineStatus check above already covers this for now)
-    // We prioritize manual 'online' status as a force-open override.
-    const { checkVendorAvailability } = require('../lib/availability');
-    const { isOpen, nextOpen } = checkVendorAvailability(vendor.operatingHours);
-    
-    if (vendor.onlineStatus !== 'online' && !isOpen) {
-      return res.status(403).json({ 
-        error: 'VENDOR_CLOSED', 
-        message: `This vendor is currently closed. They will be back online ${nextOpen || 'soon'}.`
       });
     }
 
